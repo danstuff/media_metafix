@@ -1,0 +1,1281 @@
+#!/usr/bin/env python3
+"""
+Verify and fix metadata for a music library laid out as:
+
+    <root>/<artist>/<album>/<song>.<ext>
+
+Artist and album tags are trusted from the folder structure. Title and
+track number are looked up primarily via a MusicBrainz text search on
+that trusted artist/album, matched against whatever the filename gives
+us: a filename like "Track 3" or "03 - Song" yields a track number,
+matched by position against the release's tracklist; otherwise the
+remaining filename text is fuzzy-matched against candidate titles.
+Only when that search can't place the file with confidence does it
+fall back to AcoustID audio fingerprinting, which is prone to confusing
+similar-sounding versions of a song (e.g. instrumental vs. vocal) that
+the filename/tracklist match above tells apart just fine.
+
+The recording's full MusicBrainz artist credit (main artist plus any
+featured artists) is written to a separate multi-value "artists" tag,
+alongside the single folder-trusted "artist" tag, which is left untouched.
+
+Recognition is slow and rate-limited, so nothing is written to disk
+directly -- planned changes are queued to a YAML file for review, optionally
+sanity-checked with --check (which walks through any likely mistakes it
+finds and asks what to do about each one), then applied with --apply.
+Neither --check nor --apply calls the APIs.
+
+Album art is a separate mode (--album-art): for each album directory, a
+MusicBrainz release search finds the release, its cover is fetched from
+the Cover Art Archive, scaled to 300x300, and saved as "art.jpg" (or a
+filename passed to --album-art), overwriting it if already present.
+
+A ".mmfignore" file in root, if present, excludes matching files/folders
+from every pass (recognition, --check, --apply, --rename, --album-art),
+using the same pattern syntax as ".gitignore".
+
+Setup:
+    pip install mutagen pyacoustid musicbrainzngs pyyaml pillow pathspec
+    # provides `fpcalc`, used by pyacoustid:
+    sudo apt install libchromaprint-tools
+
+    # Get a free AcoustID API key (no cost, just a signup):
+    # https://acoustid.org/new-application
+    export MMF_ACOUSTID_API_KEY=your_key_here
+
+Usage:
+    music_metafix /path/to/music/root
+
+    # optionally, sanity-check temp/changes.yml before applying it:
+    music_metafix --check temp/changes.yml
+
+    # review/edit temp/changes.yml, then:
+    music_metafix /path/to/music/root --apply temp/changes.yml
+
+    # separately, rename files based on their (now-corrected) tags:
+    music_metafix /path/to/music/root --rename "%num - %title"
+
+    # separately, whenever you want to (re)fetch cover art:
+    music_metafix /path/to/music/root --album-art
+    music_metafix /path/to/music/root --album-art cover.jpg
+
+Queue file paths are relative to root, so --apply needs the same root
+passed alongside it to resolve them.
+"""
+
+import argparse
+import difflib
+import io
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+import yaml
+
+try:
+    import acoustid
+except ImportError:
+    acoustid = None
+
+try:
+    import musicbrainzngs
+except ImportError:
+    musicbrainzngs = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
+    import pathspec
+except ImportError:
+    pathspec = None
+
+import mutagen
+from mutagen.easyid3 import EasyID3
+from mutagen.easymp4 import EasyMP4Tags
+from mutagen.id3 import TALB, TIT2, TPE1, TRCK, TXXX
+
+# Register "artists" key for mp3/m4a (not required for others)
+EasyID3.RegisterTXXXKey("artists", "ARTISTS")
+EasyMP4Tags.RegisterFreeformKey("artists", "ARTISTS")
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".wma", ".wav",
+}
+
+MMFIGNORE_FILENAME = ".mmfignore"
+
+ALBUM_ART_FILENAME = "art.jpg"
+ALBUM_ART_SIZE = (300, 300)
+COVER_ART_ARCHIVE_FRONT_URL = (
+    "https://coverartarchive.org/release/{mbid}/front"
+)
+
+MIN_ACOUSTID_SCORE = 0.6       # AcoustID's own match score (0-1)
+MIN_CONFIDENCE = 0.5           # blended confidence before trusting a match
+FUZZY_SAME_ENOUGH = 0.92       # strings this similar count as "already correct"
+FUZZY_MATCH_THRESHOLD = 0.6    # min similarity to accept a text-search match
+TITLE_CHAR_DIFF_THRESHOLD = 3   # max chars for a filename/title to match
+
+# Matches filenames like "Track 3", "track03", "01 - Song Title", "3 Song",
+# but not a 4+ digit run (e.g. a title like "1999").
+FILENAME_TRACK_RE = re.compile(
+    r"^\s*(?:track[\s_.-]*)?0*(\d{1,3})\b", re.IGNORECASE,
+)
+
+# Like FILENAME_TRACK_RE but also consumes the trailing separator,
+# e.g. "01 - Song Title" -> "Song Title".
+FILENAME_TRACK_PREFIX_RE = re.compile(
+    r"^\s*(?:track[\s_.-]*)?0*\d{1,3}\b[\s_.-]*", re.IGNORECASE,
+)
+
+ILLEGAL_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
+
+QUEUE_FIELDS = ("album", "artist", "artists", "title", "tracknumber")
+
+QUEUE_HEADER = """\
+# Music metadata changes queue.
+#
+# Review and edit the fields below as needed, then apply with:
+#   {script} {root} --apply {queue}
+#
+# Delete a field to skip just that change, or remove a whole file's entry
+# to skip that file entirely. File paths (relative to root) are the keys.
+# A "# was: ..." comment shows the field's previous value, where it had one.
+
+"""
+
+# Possible options for resolving --check warnings
+CHECK_OPTIONS = {
+    "manual": "Resolve manually in $EDITOR",
+    "skip": "Skip",
+    "delete_tnum": "Delete the new track number",
+    "delete_all_tnums": "Delete every new track number in the album",
+    "delete_field": "Delete this field from the queue",
+}
+
+# Editors that understand "editor +N file" to open at line N (1-indexed).
+LINE_JUMP_EDITORS = {
+    "vi", "vim", "nvim", "gvim", "mvim", "nano", "pico", "emacs"
+}
+
+
+class RestartCheck(Exception):
+    """Raised when the user chooses to resolve a warning by hand -- any
+    already-applied deletions are flushed to disk, an editor is opened on
+    the queue file (jumping to `line`, if known and the editor supports
+    it), and the whole check restarts from a fresh read."""
+
+    def __init__(self, line=None):
+        super().__init__()
+        self.line = line
+
+
+def check_options(*middle):
+    """Build an ordered {key: label} menu for prompt_action: resolve
+    manually first, `middle` action(s) (if any) next, skip last."""
+    keys = ("manual", *middle, "skip")
+    return {key: CHECK_OPTIONS[key] for key in keys}
+
+
+def warn(msg):
+    print(f"  ! {msg}", file=sys.stderr)
+
+
+def note(msg):
+    print(f"Note: {msg}", file=sys.stderr)
+
+
+def missing_package(display_name, pip_name, reason):
+    """Print a standard "not installed" note for an optional dependency."""
+    note(f"{display_name} not installed (pip install {pip_name}) -- {reason}")
+
+
+def prompt_action(message, options):
+    """Print `message` as a warning, then a numbered menu from `options`
+    (an ordered {key: label} mapping), and return the chosen key. Falls
+    back to "skip" if stdin has no input left to give."""
+    print(f"  ! {message}")
+    keys = list(options)
+    for i, key in enumerate(keys, 1):
+        print(f"      {i}) {options[key]}")
+    while True:
+        try:
+            choice = input(f"    Choice [1-{len(keys)}]: ").strip()
+        except EOFError:
+            print("    (no input available, leaving as-is)")
+            return "skip"
+        if choice.isdigit() and 1 <= int(choice) <= len(keys):
+            return keys[int(choice) - 1]
+        print("    Invalid choice.")
+
+
+def build_editor_command(editor, path, line):
+    """Build the argv to open `path` in `editor`, jumping to `line`
+    (1-indexed) if `editor` looks like one of the vim-likes that support
+    the "+N" line-jump syntax."""
+    command = shlex.split(editor) or ["vi"]
+    if line is not None and Path(command[0]).name in LINE_JUMP_EDITORS:
+        command.append(f"+{line}")
+    command.append(str(path))
+    return command
+
+
+# ---------------------------------------------------------------------------
+# Tag I/O. mutagen exposes a uniform "easy" dict interface (title/artist/
+# album/tracknumber) for mp3, flac, ogg/opus, m4a and wma. WAV needs raw
+# ID3 frames instead (TIT2/TPE1/TALB/TRCK).
+# ---------------------------------------------------------------------------
+
+def load_track(path):
+    """Return an opaque tag handle for `path`, or None if unreadable."""
+    if path.suffix.lower() == ".wav":
+        audio = mutagen.File(str(path))
+        return ("wav", audio)
+    audio = mutagen.File(str(path), easy=True)
+    if audio is None:
+        return None
+    return ("easy", audio)
+
+
+def get_tags(handle):
+    kind, audio = handle
+    if kind == "wav":
+        tags = audio.tags
+        if tags is None:
+            return {
+                "album": None,
+                "artist": None,
+                "artists": [],
+                "title": None,
+                "tracknumber": None,
+            }
+        txxx_artists = tags.getall("TXXX:ARTISTS")
+        return {
+            "album": tags["TALB"].text[0] if "TALB" in tags else None,
+            "artist": tags["TPE1"].text[0] if "TPE1" in tags else None,
+            "artists": (
+                [str(v) for v in txxx_artists[0].text] if txxx_artists else []
+            ),
+            "title": tags["TIT2"].text[0] if "TIT2" in tags else None,
+            "tracknumber": tags["TRCK"].text[0] if "TRCK" in tags else None,
+        }
+
+    def _str(values):
+        # ASF (wma) returns ASFUnicodeAttribute objects, not str.
+        return str(values[0]) if values else None
+
+    def _str_list(values):
+        return [str(v) for v in values] if values else []
+
+    return {
+        "album": _str(audio.get("album")),
+        "artist": _str(audio.get("artist")),
+        "artists": _str_list(audio.get("artists")),
+        "title": _str(audio.get("title")),
+        "tracknumber": _str(audio.get("tracknumber")),
+    }
+
+
+def set_tags(path, handle, updates):
+    kind, audio = handle
+    if kind == "wav":
+        if audio.tags is None:
+            audio.add_tags()
+        frame_map = {
+            "album": TALB,
+            "artist": TPE1,
+            "title": TIT2,
+            "tracknumber": TRCK,
+        }
+        for key, value in updates.items():
+            if key == "artists":
+                audio.tags.delall("TXXX:ARTISTS")
+                audio.tags.add(
+                    TXXX(encoding=3, desc="ARTISTS", text=list(value)),
+                )
+            else:
+                audio.tags.add(frame_map[key](encoding=3, text=str(value)))
+        audio.save()
+    else:
+        for key, value in updates.items():
+            audio[key] = list(value) if key == "artists" else str(value)
+        audio.save()
+
+
+# ---------------------------------------------------------------------------
+# Track-number / filename parsing
+# ---------------------------------------------------------------------------
+
+def normalize_track(value):
+    """Extract the leading integer from a tracknumber field like '3/12'."""
+    if value is None:
+        return None
+    match = re.match(r"\s*(\d+)", str(value))
+    return int(match.group(1)) if match else None
+
+
+def track_number_from_filename(stem):
+    match = FILENAME_TRACK_RE.match(stem)
+    return int(match.group(1)) if match else None
+
+
+def strip_filename_track_prefix(stem):
+    return FILENAME_TRACK_PREFIX_RE.sub("", stem)
+
+
+def fuzzy_ratio(a, b):
+    if not a or not b:
+        return 0.0
+    a, b = a.lower().strip(), b.lower().strip()
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def char_diff_count(a, b):
+    """Rough count of differing characters between two strings, used to
+    flag titles that are close but not quite a match."""
+    matcher = difflib.SequenceMatcher(None, a, b)
+    return sum(
+        max(i2 - i1, j2 - j1)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != "equal"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Filename rendering, e.g. "%num - %title" -> "01 - Song Title.mp3"
+# ---------------------------------------------------------------------------
+
+def sanitize_filename_part(text):
+    return ILLEGAL_FILENAME_CHARS_RE.sub("", text).strip()
+
+
+def render_filename(template, path, final_tags):
+    track_no = normalize_track(final_tags.get("tracknumber"))
+    values = {
+        "%num": f"{track_no:02d}" if track_no is not None else "00",
+        "%title": final_tags.get("title") or path.stem,
+        "%artist": final_tags.get("artist") or "",
+        "%album": final_tags.get("album") or "",
+        "%ext": path.suffix.lstrip("."),
+    }
+    name = template
+    for placeholder, value in values.items():
+        name = name.replace(placeholder, sanitize_filename_part(str(value)))
+    if "%ext" not in template:
+        name += path.suffix
+    # The template itself may contain invalid filename characters too.
+    name = sanitize_filename_part(name)
+    if name in ("", ".", ".."):
+        name = "_" + name
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Recognition: AcoustID audio fingerprinting (primary), MusicBrainz text
+# search (fallback for tracks AcoustID's database doesn't know about).
+# ---------------------------------------------------------------------------
+
+def recognize_via_acoustid(path, api_key, folder_artist, folder_album):
+    """Fingerprint the file and look it up. Returns a dict with title/
+    tracknumber/track_total/confidence, or None if nothing confident."""
+    duration, fp = acoustid.fingerprint_file(str(path))
+    response = acoustid.lookup(
+        api_key, fp, duration,
+        meta=["recordings", "releasegroups", "releases", "tracks", "compress"],
+    )
+    if response.get("status") != "ok":
+        message = response.get("error", {}).get("message", "unknown error")
+        raise acoustid.WebServiceError(message)
+
+    best = None  # (confidence, title, track_no, track_total, artist_names)
+    results = sorted(
+        response.get("results", []),
+        key=lambda r: r.get("score", 0), reverse=True,
+    )
+    for result in results:
+        score = result.get("score", 0)
+        if score < MIN_ACOUSTID_SCORE:
+            continue
+        for recording in result.get("recordings", []):
+            title = recording.get("title")
+            if not title:
+                continue
+
+            artists = recording.get("artists") or []
+            artist_name = (
+                "".join(a["name"] + a.get("joinphrase", "") for a in artists)
+                if artists else None
+            )
+            artist_conf = (
+                fuzzy_ratio(artist_name, folder_artist) if artist_name else 0.3
+            )
+            # Full credited-artist list, for the separate "artists" tag.
+            artist_names = [a["name"] for a in artists]
+
+            track_no = track_total = None
+            album_conf = 0.0
+            for release_group in recording.get("releasegroups", []):
+                for release in release_group.get("releases", []):
+                    release_conf = fuzzy_ratio(
+                        release.get("title"), folder_album,
+                    )
+                    for medium in release.get("mediums", []):
+                        for track in medium.get("tracks", []):
+                            same_recording = (
+                                track.get("id") == recording.get("id")
+                            )
+                            same_title = (
+                                fuzzy_ratio(track.get("title"), title) > 0.9
+                            )
+                            if (same_recording or same_title) \
+                                    and release_conf > album_conf:
+                                album_conf = release_conf
+                                track_no = track.get("position")
+                                track_total = medium.get("track_count")
+
+            confidence = score * 0.5 + artist_conf * 0.3 + album_conf * 0.2
+            if best is None or confidence > best[0]:
+                best = (confidence, title, track_no, track_total, artist_names)
+
+    if best is None or best[0] < MIN_CONFIDENCE:
+        return None
+    confidence, title, track_no, track_total, artist_names = best
+    return {
+        "title": title, "tracknumber": track_no, "track_total": track_total,
+        "confidence": confidence, "artists": artist_names,
+    }
+
+
+def recognize_via_musicbrainz_text(folder_artist, folder_album):
+    """Search MusicBrainz by artist+album name and return
+    {position: {"title": ..., "artists": [...]}}."""
+    results = musicbrainzngs.search_releases(
+        artist=folder_artist, release=folder_album, limit=1,
+    )
+    releases = results.get("release-list") or []
+    if not releases:
+        return None
+    full = musicbrainzngs.get_release_by_id(
+        releases[0]["id"], includes=["recordings", "artist-credits"],
+    )
+    track_map = {}
+    for medium in full["release"].get("medium-list", []):
+        for track in medium.get("track-list", []):
+            recording = track["recording"]
+            credit = recording.get("artist-credit") or []
+            artist_names = [
+                c["artist"]["name"] for c in credit
+                if isinstance(c, dict) and "artist" in c
+            ]
+            track_map[int(track["position"])] = {
+                "title": recording["title"], "artists": artist_names,
+            }
+    return track_map or None
+
+
+# ---------------------------------------------------------------------------
+# Album art: MusicBrainz release search + Cover Art Archive, resized and
+# saved directly to disk (independent of the tag-change queue).
+# ---------------------------------------------------------------------------
+
+def find_release_id(artist_name, album_name):
+    results = musicbrainzngs.search_releases(
+        artist=artist_name, release=album_name, limit=1,
+    )
+    releases = results.get("release-list") or []
+    return releases[0]["id"] if releases else None
+
+
+def fetch_cover_art(release_id):
+    request = Request(
+        COVER_ART_ARCHIVE_FRONT_URL.format(mbid=release_id),
+        headers={"User-Agent": "music-metafix/0.0"},
+    )
+    with urlopen(request, timeout=20) as response:
+        return response.read()
+
+
+def save_album_art(image_bytes, dest_path):
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = image.resize(ALBUM_ART_SIZE, Image.LANCZOS)
+    image.save(dest_path, "JPEG")
+
+
+def download_album_art(artist_name, album_name, album_dir, filename):
+    """Fetch cover art for one album into <album_dir>/<filename>, overwriting
+    it if present. Errors are logged and skipped, never raised."""
+    art_path = album_dir / filename
+    album_key = f"{artist_name}/{album_name}"
+
+    try:
+        release_id = find_release_id(artist_name, album_name)
+    except Exception as exc:
+        warn(f"MusicBrainz release search failed for {album_key}: {exc}")
+        return
+    if not release_id:
+        warn(f"No MusicBrainz release found for album art: {album_key}")
+        return
+
+    try:
+        save_album_art(fetch_cover_art(release_id), art_path)
+        print(f"Album art: {art_path}")
+    except HTTPError as exc:
+        if exc.code == 404:
+            warn(f"No cover art available for {album_key}")
+        else:
+            warn(f"Cover art download failed for {album_key}: {exc}")
+    except (URLError, OSError) as exc:
+        warn(f"Cover art download failed for {album_key}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Main pass
+# ---------------------------------------------------------------------------
+
+def load_mmfignore(root):
+    """Load ".mmfignore" from `root` as a gitignore-style pathspec, or
+    None if there's no such file (or pathspec isn't installed)."""
+    ignore_path = Path(root) / MMFIGNORE_FILENAME
+    if not ignore_path.exists():
+        return None
+    if pathspec is None:
+        missing_package(
+            "pathspec", "pathspec",
+            f"{ignore_path} is present but its rules can't be applied.",
+        )
+        return None
+    with open(ignore_path, encoding="utf-8") as f:
+        return pathspec.PathSpec.from_lines("gitwildmatch", f)
+
+
+def is_ignored(spec, root, path):
+    """True if `path` (a file or directory under `root`) matches the
+    ".mmfignore" pathspec `spec` (which may be None, matching nothing)."""
+    if spec is None:
+        return False
+    rel = path.relative_to(root).as_posix()
+    if path.is_dir():
+        rel += "/"
+    return spec.match_file(rel)
+
+
+def iter_albums(root, spec=None):
+    root = Path(root)
+    if spec is None:
+        spec = load_mmfignore(root)
+    for artist_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        if is_ignored(spec, root, artist_dir):
+            continue
+        for album_dir in sorted(p for p in artist_dir.iterdir() if p.is_dir()):
+            if is_ignored(spec, root, album_dir):
+                continue
+            yield artist_dir.name, album_dir.name, album_dir
+
+
+def iter_music_files(root):
+    root = Path(root)
+    spec = load_mmfignore(root)
+    for artist_name, album_name, album_dir in iter_albums(root, spec):
+        for song_path in sorted(p for p in album_dir.iterdir() if p.is_file()):
+            if song_path.suffix.lower() in AUDIO_EXTENSIONS \
+                    and not is_ignored(spec, root, song_path):
+                yield artist_name, album_name, song_path
+
+
+def run_rename(root, template):
+    """Rename every music file under root to `template`, rendered from its
+    current on-disk tags. A standalone mode, typically run after --apply."""
+    for _artist_name, _album_name, path in iter_music_files(root):
+        handle = load_track(path)
+        if handle is None:
+            warn(f"Could not read tags, skipping: {path}")
+            continue
+
+        new_name = render_filename(template, path, get_tags(handle))
+        if new_name == path.name:
+            continue
+
+        try:
+            new_path = path.with_name(new_name)
+        except ValueError as exc:
+            warn(
+                f"Invalid rename target, skipping: "
+                f"{path} -> {new_name!r} ({exc})"
+            )
+            continue
+        if new_path.exists():
+            warn(f"Rename target already exists, skipping: {new_path}")
+            continue
+
+        path.rename(new_path)
+        print(f"Renamed: {path.name} -> {new_name}")
+
+
+def configure_musicbrainz(contact):
+    """Set musicbrainzngs's required user-agent. Returns False if the
+    package isn't installed, leaving the "not installed" note to the
+    caller since its wording depends on which feature needed it."""
+    if not musicbrainzngs:
+        return False
+    musicbrainzngs.set_useragent("music-metafix", "0.0", contact)
+    return True
+
+
+def run_album_art(root, filename, contact):
+    """Download/overwrite <filename> for every album under root. A
+    standalone mode."""
+    if not configure_musicbrainz(contact):
+        missing_package(
+            "musicbrainzngs", "musicbrainzngs", "can't download album art.",
+        )
+        return
+    if Image is None:
+        missing_package("Pillow", "pillow", "can't download album art.")
+        return
+
+    root = Path(root)
+    spec = load_mmfignore(root)
+    for artist_name, album_name, album_dir in iter_albums(root, spec):
+        if is_ignored(spec, root, album_dir / filename):
+            continue
+        download_album_art(artist_name, album_name, album_dir, filename)
+
+
+def render_yaml_scalar(value):
+    """Render `value` as a single-line flow-style YAML value, for a field
+    line or a trailing "# was: ..." comment."""
+    dumped = yaml.safe_dump(
+        value, default_flow_style=True, allow_unicode=True, width=float("inf"),
+    )
+    return dumped.split("\n", 1)[0]
+
+
+def apply_track_match(updates, current, pos, match):
+    """Queue title/tracknumber/artists updates for a matched MusicBrainz
+    track `match` (with "title"/"artists" keys) at position `pos`, wherever
+    it differs from `current`."""
+    title_ratio = fuzzy_ratio(match["title"], current.get("title"))
+    if not current.get("title") or title_ratio < FUZZY_SAME_ENOUGH:
+        updates["title"] = match["title"]
+    if normalize_track(current.get("tracknumber")) != pos:
+        updates["tracknumber"] = str(pos)
+    if match["artists"] and match["artists"] != current.get("artists"):
+        updates["artists"] = match["artists"]
+
+
+def compute_change(root, artist_name, album_name, path, args, mb_cache):
+    """Work out what (if anything) should change for `path`. Read-only.
+    Returns None if nothing needs to change; otherwise (file, fields,
+    previous_values) with every QUEUE_FIELDS key present in `fields` --
+    an unrecognized field falls back to its current tag value, or None
+    if there isn't one. `previous_values` holds the prior tag value, but
+    only for keys that are genuinely changing."""
+    handle = load_track(path)
+    if handle is None:
+        raise RuntimeError("could not read tags")
+
+    current = get_tags(handle)
+    filename_track = track_number_from_filename(path.stem)
+    filename_title = strip_filename_track_prefix(path.stem).strip()
+    updates = {}
+
+    if (current.get("artist") or "").strip() != artist_name:
+        updates["artist"] = artist_name
+    if (current.get("album") or "").strip() != album_name:
+        updates["album"] = album_name
+
+    album_key = f"{artist_name}/{album_name}"
+
+    matched = False
+    if musicbrainzngs and not args.no_musicbrainz:
+        cache_key = (artist_name, album_name)
+        if cache_key not in mb_cache:
+            try:
+                mb_cache[cache_key] = recognize_via_musicbrainz_text(
+                    artist_name, album_name,
+                )
+            except Exception as exc:
+                warn(f"MusicBrainz search failed for {album_key}: {exc}")
+                mb_cache[cache_key] = None
+        track_map = mb_cache[cache_key]
+
+        if track_map and filename_track is not None \
+                and filename_track in track_map:
+            # Filename gives the position directly (e.g. "Track 03") --
+            # more reliable than fuzzy-matching it against real titles.
+            apply_track_match(
+                updates, current, filename_track, track_map[filename_track],
+            )
+            matched = True
+        elif track_map and filename_title:
+            best_pos, best_score = None, 0.0
+            for pos, data in track_map.items():
+                score = fuzzy_ratio(data["title"], filename_title)
+                if score > best_score:
+                    best_score, best_pos = score, pos
+            if best_pos is not None and best_score >= FUZZY_MATCH_THRESHOLD:
+                apply_track_match(
+                    updates, current, best_pos, track_map[best_pos],
+                )
+                matched = True
+
+    # Fall back to AcoustID fingerprinting only when the filename/tracklist
+    # match above couldn't place this file with confidence -- audio
+    # fingerprints can't tell apart similar-sounding versions of a song
+    # (e.g. instrumental vs. vocal) as reliably as the match above.
+    if not matched and acoustid and args.acoustid_api_key:
+        recognized = None
+        try:
+            recognized = recognize_via_acoustid(
+                path, args.acoustid_api_key, artist_name, album_name,
+            )
+        except acoustid.NoBackendError:
+            warn(
+                "fpcalc/chromaprint not found -- install "
+                "libchromaprint-tools. Disabling AcoustID for the rest "
+                "of this run."
+            )
+            args.acoustid_api_key = None
+        except acoustid.WebServiceError as exc:
+            warn(
+                f"AcoustID web service error, disabling AcoustID for "
+                f"the rest of this run: {exc}"
+            )
+            args.acoustid_api_key = None
+        except acoustid.AcoustidError as exc:
+            warn(f"AcoustID lookup failed for {path.name}: {exc}")
+
+        if recognized:
+            title_ratio = fuzzy_ratio(recognized["title"], current.get("title"))
+            if recognized["title"] and title_ratio < FUZZY_SAME_ENOUGH:
+                updates["title"] = recognized["title"]
+            if recognized["tracknumber"]:
+                new_track = str(recognized["tracknumber"])
+                if recognized.get("track_total"):
+                    new_track += f"/{recognized['track_total']}"
+                old_track = normalize_track(current.get("tracknumber"))
+                if normalize_track(new_track) != old_track:
+                    updates["tracknumber"] = new_track
+            new_artists = recognized.get("artists")
+            if new_artists and new_artists != current.get("artists"):
+                updates["artists"] = new_artists
+
+    # Last resort: filename alone still gives us a track number.
+    if "tracknumber" not in updates and filename_track is not None \
+            and normalize_track(current.get("tracknumber")) != filename_track:
+        updates["tracknumber"] = str(filename_track)
+
+    if not updates:
+        return None
+
+    # Every field is queued, not just the ones that changed: an updated
+    # field takes the new value, anything else falls back to whatever's
+    # already tagged, and fields with neither are queued as null.
+    fields = {}
+    previous = {}
+    for key in QUEUE_FIELDS:
+        if key in updates:
+            value = updates[key]
+            previous[key] = current.get(key)
+        else:
+            value = current.get(key) or None
+        if key == "tracknumber" and value is not None and "/" not in value:
+            value = int(value)
+        fields[key] = value
+    return str(path.relative_to(root)), fields, previous
+
+
+def apply_queue(root, queue_file):
+    root = Path(root)
+    spec = load_mmfignore(root)
+    with open(queue_file, encoding="utf-8") as f:
+        entries = yaml.safe_load(f) or {}
+
+    counts = {"applied": 0, "error": 0, "ignored": 0}
+    for file, fields in entries.items():
+        path = root / file
+        if is_ignored(spec, root, path):
+            warn(f"Ignored by .mmfignore, skipping: {path}")
+            counts["ignored"] += 1
+            continue
+        if not path.exists():
+            warn(f"File not found, skipping: {path}")
+            counts["error"] += 1
+            continue
+
+        try:
+            updates = {}
+            for key in QUEUE_FIELDS:
+                value = fields.get(key)
+                if value is None:
+                    continue
+                updates[key] = (
+                    [str(v) for v in value] if key == "artists" else str(value)
+                )
+            if updates:
+                handle = load_track(path)
+                if handle is None:
+                    raise RuntimeError("could not read tags")
+                set_tags(path, handle, updates)
+
+            print(f"Applied: {path}")
+            counts["applied"] += 1
+        except Exception as exc:
+            warn(f"Failed to apply changes to {path}: {exc}")
+            counts["error"] += 1
+
+    print(
+        f"\nDone. {counts['applied']} applied, {counts['error']} errors, "
+        f"{counts['ignored']} ignored."
+    )
+
+
+def find_entry_line(lines, file):
+    """Return the raw-line index of `file`'s top-level key line, or None."""
+    for i, line in enumerate(lines):
+        if not line or line[0] in " #":
+            continue
+        try:
+            parsed = yaml.safe_load(line)
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, dict) and file in parsed:
+            return i
+    return None
+
+
+def entry_line_range(lines, start):
+    """Return the exclusive end index of the entry starting at `start`."""
+    end = start + 1
+    while end < len(lines) and lines[end].startswith("  "):
+        end += 1
+    return end
+
+
+def find_field_line(lines, file, key):
+    """Return the raw-line index of `key` within `file`'s entry, or None
+    if the entry or the field within it can't be found."""
+    start = find_entry_line(lines, file)
+    if start is None:
+        return None
+    end = entry_line_range(lines, start)
+    for i in range(start + 1, end):
+        if re.match(rf"^  {re.escape(key)}:", lines[i]):
+            return i
+    return None
+
+
+def line_has_ok_comment(lines, index):
+    """True if `lines[index]` carries a trailing '# OK' comment, marking
+    whatever warning refers to it as already reviewed and intentional."""
+    if index is None or index >= len(lines):
+        return False
+    return bool(re.search(r"# OK\b", lines[index], re.IGNORECASE))
+
+
+def delete_field_line(lines, file, key):
+    """Remove the raw line for `key` within `file`'s entry, in place."""
+    i = find_field_line(lines, file, key)
+    if i is not None:
+        del lines[i]
+
+
+def clear_tracknumber(lines, file, fields):
+    """Delete the queued tracknumber field for `file`, in the raw queue
+    text and in the parsed `fields`, in place."""
+    delete_field_line(lines, file, "tracknumber")
+    del fields["tracknumber"]
+
+
+def run_check(queue_file):
+    """Scan a previously generated queue file for likely mistakes,
+    interactively asking what to do about each one found: resolve it by
+    hand, leave it as-is, or delete the offending field/entry. Makes no
+    API calls, needs no root -- every check is derived from the YAML
+    alone."""
+    with open(queue_file, encoding="utf-8") as f:
+        raw_text = f.read()
+    lines = raw_text.splitlines()
+    entries = yaml.safe_load(raw_text) or {}
+
+    album_entries = {}  # album dir -> [(file, fields), ...] for that album
+    for file, fields in entries.items():
+        album_entries.setdefault(Path(file).parent, []).append((file, fields))
+
+    warnings = 0
+    resolved = 0
+    changed = False
+
+    try:
+        for album_dir, group in album_entries.items():
+            has_track_update = [
+                "tracknumber" in fields for _file, fields in group
+            ]
+            if any(has_track_update) and not all(has_track_update):
+                warnings += 1
+                update_count = sum(has_track_update)
+                message = (
+                    f"{album_dir}: only {update_count} tracks in this "
+                    f"album were given a new track number."
+                )
+                entry_line = find_entry_line(lines, group[0][0])
+                if line_has_ok_comment(lines, entry_line):
+                    print(f"  ! {message}")
+                else:
+                    action = prompt_action(
+                        message, check_options("delete_all_tnums"),
+                    )
+                    if action == "manual":
+                        raise RestartCheck(entry_line)
+                    elif action == "delete_all_tnums":
+                        for file, fields in group:
+                            if "tracknumber" in fields:
+                                clear_tracknumber(lines, file, fields)
+                                changed = True
+                        resolved += 1
+
+            titles_seen = {}
+            for file, fields in group:
+                title = fields.get("title")
+                if title is not None:
+                    titles_seen.setdefault(
+                        str(title).strip().casefold(), [],
+                    ).append((file, title))
+
+            for dupes in titles_seen.values():
+                if len(dupes) < 2:
+                    continue
+                warnings += 1
+                dupe_files = [file for file, _title in dupes]
+                message = (
+                    f"{album_dir}: {len(dupes)} tracks were given the same "
+                    f"title {dupes[0][1]!r}: {', '.join(dupe_files)}."
+                )
+                title_lines = [
+                    find_field_line(lines, file, "title") for file in dupe_files
+                ]
+                if any(line_has_ok_comment(lines, i) for i in title_lines):
+                    print(f"  ! {message}")
+                else:
+                    action = prompt_action(message, check_options())
+                    if action == "manual":
+                        raise RestartCheck(title_lines[0])
+
+            for file, fields in list(group):
+                rel_path = Path(file)
+
+                for key, value in list(fields.items()):
+                    if value is not None:
+                        continue
+                    warnings += 1
+                    message = (
+                        f"{file}: {key} couldn't be determined, and is "
+                        f"set to null."
+                    )
+                    field_line = find_field_line(lines, file, key)
+                    if line_has_ok_comment(lines, field_line):
+                        print(f"  ! {message}")
+                        continue
+                    action = prompt_action(
+                        message, check_options("delete_field"),
+                    )
+                    if action == "manual":
+                        raise RestartCheck(field_line)
+                    elif action == "delete_field":
+                        delete_field_line(lines, file, key)
+                        del fields[key]
+                        changed = True
+                        resolved += 1
+
+                raw_track = fields.get("tracknumber")
+                title = fields.get("title")
+                track_no = None
+
+                if raw_track is not None:
+                    tnum_line = find_field_line(lines, file, "tracknumber")
+                    if not isinstance(raw_track, int):
+                        warnings += 1
+                        message = (
+                            f"{file}: track number is not an integer: "
+                            f"{raw_track!r}."
+                        )
+                        if line_has_ok_comment(lines, tnum_line):
+                            print(f"  ! {message}")
+                        else:
+                            action = prompt_action(
+                                message, check_options("delete_tnum"),
+                            )
+                            if action == "manual":
+                                raise RestartCheck(tnum_line)
+                            elif action == "delete_tnum":
+                                clear_tracknumber(lines, file, fields)
+                                changed = True
+                                resolved += 1
+                                raw_track = None
+
+                    track_no = normalize_track(raw_track)
+                    if track_no is not None and track_no > len(group):
+                        warnings += 1
+                        message = (
+                            f"{file}: track number {track_no} is greater "
+                            f"than the {len(group)} occurrence(s) of this "
+                            f"album in the queue."
+                        )
+                        if line_has_ok_comment(lines, tnum_line):
+                            print(f"  ! {message}")
+                        else:
+                            action = prompt_action(
+                                message, check_options("delete_tnum"),
+                            )
+                            if action == "manual":
+                                raise RestartCheck(tnum_line)
+                            elif action == "delete_tnum":
+                                clear_tracknumber(lines, file, fields)
+                                changed = True
+                                resolved += 1
+
+                if track_no is not None or title is not None:
+                    stem = rel_path.stem
+                    filename_track = track_number_from_filename(stem)
+                    track_matches = (
+                        filename_track is not None and track_no is not None
+                        and filename_track == track_no
+                    )
+
+                    title_matches = False
+                    if title:
+                        title_guess = strip_filename_track_prefix(stem)
+                        title_guess = title_guess.lower().strip()
+                        diff = char_diff_count(
+                            title_guess, title.lower().strip(),
+                        )
+                        title_matches = diff <= TITLE_CHAR_DIFF_THRESHOLD
+
+                    if not track_matches and not title_matches:
+                        warnings += 1
+                        mismatches = []
+                        if track_no is not None:
+                            mismatches.append(f"track number {track_no}")
+                        if title is not None:
+                            mismatches.append(f"title {title!r}")
+                        message = (
+                            f"{file}: filename doesn't match its new "
+                            f"{' or '.join(mismatches)}."
+                        )
+                        ok_lines = [
+                            tnum_line if track_no is not None else None,
+                            find_field_line(lines, file, "title")
+                            if title is not None else None,
+                        ]
+                        if any(
+                            line_has_ok_comment(lines, i) for i in ok_lines
+                        ):
+                            print(f"  ! {message}")
+                        else:
+                            action = prompt_action(message, check_options())
+                            if action == "manual":
+                                raise RestartCheck(find_entry_line(lines, file))
+    except RestartCheck as restart:
+        if changed:
+            with open(queue_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        editor = os.environ.get("EDITOR", "vi")
+        line = restart.line + 1 if restart.line is not None else None
+        subprocess.call(build_editor_command(editor, queue_file, line))
+        print(f"\nRe-checking {queue_file} after manual edits...\n")
+        run_check(queue_file)
+        return
+
+    if changed:
+        with open(queue_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    if warnings:
+        print(
+            f"\n{warnings} warning(s) found in {queue_file}, "
+            f"{resolved} resolved"
+        )
+    else:
+        print(f"\nNo inconsistencies found in {queue_file}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "root", nargs="?",
+        help="Root folder containing artist/album/song files. "
+             "Not needed for --check.",
+    )
+
+    parser.add_argument(
+        "--apply", metavar="FILE",
+        help="Apply a previously queued changes file (see --queue) and "
+             "exit. No recognition, no API calls.",
+    )
+
+    parser.add_argument(
+        "--check", metavar="FILE",
+        help="Scan a previously queued changes file (see --queue) for "
+             "likely mistakes, interactively asking what to do about each "
+             "one found (resolve by hand in $EDITOR, do nothing, or "
+             "delete the offending field), then exit. No API calls, "
+             "no root needed.",
+    )
+
+    parser.add_argument(
+        "--album-art", nargs="?", const=ALBUM_ART_FILENAME, default=None,
+        metavar="FILENAME",
+        help="Download album art (scaled to 300x300, overwriting any "
+             "existing file) for every album under root, then exit. "
+             "Saved as FILENAME if given, otherwise "
+             f"{ALBUM_ART_FILENAME!r}. A separate mode -- run it on its "
+             "own.",
+    )
+
+    parser.add_argument(
+        "--acoustid-api-key", default=os.environ.get("MMF_ACOUSTID_API_KEY"),
+        help="AcoustID API key (default: $MMF_ACOUSTID_API_KEY). "
+             "Free at https://acoustid.org/api-key",
+    )
+    parser.add_argument(
+        "--no-acoustid", action="store_true",
+        help="Disable the AcoustID audio-fingerprinting fallback used "
+             "when the filename/tracklist match against MusicBrainz "
+             "can't place a file",
+    )
+
+    parser.add_argument(
+        "--musicbrainz-contact",
+        default=os.environ.get("MMF_MUSICBRAINZ_CONTACT"),
+        help="Contact email/URL sent to MusicBrainz as required by their "
+             "API usage policy (default: $MMF_MUSICBRAINZ_CONTACT)",
+    )
+    parser.add_argument(
+        "--no-musicbrainz", action="store_true",
+        help="Disable the MusicBrainz text search matched against the "
+             "filename (falls straight through to AcoustID)",
+    )
+
+    parser.add_argument(
+        "--rename", metavar="TEMPLATE", default=None,
+        help="Rename files under root to this template using their "
+             "current tags, then exit, e.g. '%%num - %%title' -> "
+             "'01 - Song Title.mp3'. Placeholders: %%num, %%title, "
+             "%%artist, %%album, %%ext. A separate mode -- run it on "
+             "its own, typically after --apply.",
+    )
+
+    parser.add_argument(
+        "--queue", metavar="FILE", default="temp/changes.yml",
+        help="Where to write queued changes for review instead of "
+             "applying them immediately (default: %(default)s)",
+    )
+
+    args = parser.parse_args()
+
+    if args.check:
+        run_check(args.check)
+        return
+
+    if args.root is None:
+        parser.error("the following arguments are required: root")
+
+    if args.apply:
+        apply_queue(args.root, args.apply)
+        return
+
+    if args.album_art is not None:
+        run_album_art(args.root, args.album_art, args.musicbrainz_contact)
+        return
+
+    if args.rename:
+        run_rename(args.root, args.rename)
+        return
+
+    if args.no_acoustid:
+        args.acoustid_api_key = None
+    elif not acoustid:
+        missing_package(
+            "pyacoustid", "pyacoustid", "audio fingerprinting disabled.",
+        )
+    elif not args.acoustid_api_key:
+        note(
+            "no AcoustID API key set (--acoustid-api-key or "
+            "$MMF_ACOUSTID_API_KEY) -- audio fingerprinting disabled."
+        )
+    if not configure_musicbrainz(args.musicbrainz_contact):
+        missing_package(
+            "musicbrainzngs", "musicbrainzngs", "text-search fallback "
+            "disabled.",
+        )
+
+    counts = {"queued": 0, "ok": 0, "error": 0}
+    mb_cache = {}
+
+    # Flushed + fsynced per entry so a crash or Ctrl-C partway through
+    # doesn't lose already-computed results.
+    queue_path = Path(args.queue)
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(queue_path, "w", encoding="utf-8") as queue_f:
+        queue_f.write(QUEUE_HEADER.format(
+            script=sys.argv[0], root=args.root, queue=args.queue,
+        ))
+        queue_f.flush()
+
+        for artist_name, album_name, path in iter_music_files(args.root):
+            try:
+                entry = compute_change(
+                    args.root, artist_name, album_name, path, args, mb_cache,
+                )
+            except Exception as exc:
+                warn(f"Unexpected error on {path}: {exc}")
+                counts["error"] += 1
+                continue
+
+            if entry is None:
+                print(f"{path}: OK")
+                counts["ok"] += 1
+                continue
+
+            file, fields, previous = entry
+            print(file)
+            for key in QUEUE_FIELDS:
+                print(f"    {key}: {fields[key]!r}")
+
+            queue_f.write(f"{render_yaml_scalar(file)}:\n")
+            for key, value in fields.items():
+                line = f"  {key}: {render_yaml_scalar(value)}"
+                if previous.get(key):
+                    line += f"  # was: {render_yaml_scalar(previous[key])}"
+                queue_f.write(line + "\n")
+            queue_f.flush()
+            os.fsync(queue_f.fileno())
+            counts["queued"] += 1
+
+    if counts["queued"]:
+        print(
+            f"\n{counts['queued']} pending change(s) written to "
+            f"{args.queue}"
+        )
+        print(
+            f"Review/edit it, then run:\n  "
+            f"{sys.argv[0]} {args.root} --apply {args.queue}"
+        )
+    else:
+        print("\nNo changes needed.")
+    print(f"({counts['ok']} already correct, {counts['error']} errors)")
+
+
+if __name__ == "__main__":
+    main()
