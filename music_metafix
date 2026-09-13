@@ -895,6 +895,21 @@ def clear_tracknumber(lines, file, fields):
     del fields["tracknumber"]
 
 
+def find_duplicate_fields(group, key, normalize):
+    """Group entries in `group` (an album's [(file, fields), ...]) by the
+    normalized value of their `key` field. Returns only the groups with
+    2+ occurrences, as a list of [(file, raw_value), ...] lists."""
+    seen = {}
+    for file, fields in group:
+        value = fields.get(key)
+        if value is None:
+            continue
+        norm = normalize(value)
+        if norm is not None:
+            seen.setdefault(norm, []).append((file, value))
+    return [dupes for dupes in seen.values() if len(dupes) > 1]
+
+
 def run_check(queue_file):
     """Scan a previously generated queue file for likely mistakes,
     interactively asking what to do about each one found: resolve it by
@@ -942,32 +957,31 @@ def run_check(queue_file):
                                 changed = True
                         resolved += 1
 
-            titles_seen = {}
-            for file, fields in group:
-                title = fields.get("title")
-                if title is not None:
-                    titles_seen.setdefault(
-                        str(title).strip().casefold(), [],
-                    ).append((file, title))
-
-            for dupes in titles_seen.values():
-                if len(dupes) < 2:
-                    continue
-                warnings += 1
-                dupe_files = [file for file, _title in dupes]
-                message = (
-                    f"{album_dir}: {len(dupes)} tracks were given the same "
-                    f"title {dupes[0][1]!r}: {', '.join(dupe_files)}."
-                )
-                title_lines = [
-                    find_field_line(lines, file, "title") for file in dupe_files
-                ]
-                if any(line_has_ok_comment(lines, i) for i in title_lines):
-                    print(f"  ! {message}")
-                else:
-                    action = prompt_action(message, check_options())
-                    if action == "manual":
-                        raise RestartCheck(title_lines[0])
+            dupe_checks = (
+                ("title", "title", lambda v: str(v).strip().casefold()),
+                ("tracknumber", "track number", normalize_track),
+            )
+            for key, label, normalize in dupe_checks:
+                for dupes in find_duplicate_fields(group, key, normalize):
+                    warnings += 1
+                    dupe_files = [file for file, _value in dupes]
+                    message = (
+                        f"{album_dir}: {len(dupes)} tracks were given "
+                        f"the same {label} {dupes[0][1]!r}: "
+                        f"{', '.join(dupe_files)}."
+                    )
+                    dupe_lines = [
+                        find_field_line(lines, file, key)
+                        for file in dupe_files
+                    ]
+                    if any(
+                        line_has_ok_comment(lines, i) for i in dupe_lines
+                    ):
+                        print(f"  ! {message}")
+                    else:
+                        action = prompt_action(message, check_options())
+                        if action == "manual":
+                            raise RestartCheck(dupe_lines[0])
 
             for file, fields in list(group):
                 rel_path = Path(file)
