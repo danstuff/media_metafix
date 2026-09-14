@@ -290,7 +290,7 @@ def char_diff_count(a, b):
 # Filename rendering, e.g. "%num - %title" -> "01 - Song Title.mp3"
 # ---------------------------------------------------------------------------
 
-ILLEGAL_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
+ILLEGAL_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
 def sanitize_filename_part(text):
@@ -301,7 +301,7 @@ def render_filename(template, path, final_tags):
     track_no = normalize_track(final_tags.get("tracknumber"))
     values = {
         "%num": f"{track_no:02d}" if track_no is not None else "00",
-        "%title": final_tags.get("title") or path.stem,
+        "%title": (final_tags.get("title") or "").strip() or path.stem,
         "%artist": final_tags.get("artist") or "",
         "%album": final_tags.get("album") or "",
         "%ext": path.suffix.lstrip("."),
@@ -618,17 +618,17 @@ def run_rename(root, template):
 
         try:
             new_path = path.with_name(new_name)
+            if new_path.exists():
+                warn(f"Rename target already exists, skipping: {new_path}")
+                continue
+            path.rename(new_path)
         except ValueError as exc:
             warn(
                 f"Invalid rename target, skipping: "
                 f"{path} -> {new_name!r} ({exc})"
             )
             continue
-        if new_path.exists():
-            warn(f"Rename target already exists, skipping: {new_path}")
-            continue
 
-        path.rename(new_path)
         print(f"Renamed: {path.name} -> {new_name}")
 
 
@@ -858,9 +858,12 @@ def queue_fields_to_tag_updates(fields):
         value = fields.get(key)
         if value is None:
             continue
-        updates[key] = (
-            [str(v) for v in value] if key == "artists" else str(value)
-        )
+        if key == "artists":
+            updates[key] = [str(v) for v in value]
+        elif key == "title":
+            updates[key] = str(value).strip()
+        else:
+            updates[key] = str(value)
     return updates
 
 
