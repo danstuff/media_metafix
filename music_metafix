@@ -1347,28 +1347,29 @@ def check_title_track_prefix(lines, stats, file, fields):
 
 
 def check_title_matches_other_field(lines, stats, file, fields):
-    """Warn if the queued title is nearly identical to the album or
-    artist name -- often a sign of a wrong MusicBrainz match."""
+    """Warn if the queued title is nearly identical to the artist
+    name -- often a sign of a wrong MusicBrainz match. (Titles matching
+    the album name are not flagged -- eponymous tracks are common.)"""
     title = fields.get("title")
     if not title:
         return
 
-    for other_key in ("album", "artist"):
-        other_value = fields.get(other_key)
-        if not other_value:
-            continue
-        if fuzzy_ratio(title, str(other_value)) < FUZZY_SAME_ENOUGH:
-            continue
+    other_key = "artist"
+    other_value = fields.get(other_key)
+    if not other_value:
+        return
+    if fuzzy_ratio(title, str(other_value)) < FUZZY_SAME_ENOUGH:
+        return
 
-        stats.warnings += 1
-        message = (
-            f"{file}: new title matches the {other_key} "
-            f"({other_value!r}) almost exactly -- possible wrong match."
-        )
-        title_line = find_field_line(lines, file, "title")
-        resolve_warning(
-            lines, message, [title_line], check_options(), title_line,
-        )
+    stats.warnings += 1
+    message = (
+        f"{file}: new title matches the {other_key} "
+        f"({other_value!r}) almost exactly -- possible wrong match."
+    )
+    title_line = find_field_line(lines, file, "title")
+    resolve_warning(
+        lines, message, [title_line], check_options(), title_line,
+    )
 
 
 def write_queue_lines(queue_file, lines):
