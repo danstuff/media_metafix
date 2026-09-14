@@ -108,24 +108,15 @@ EasyMP4Tags.RegisterFreeformKey("artists", "ARTISTS")
 
 # Possible options for resolving --check warnings
 CHECK_OPTIONS = {
-    "manual": "Resolve manually in $EDITOR",
+    "manual": "Resolve in editor",
     "skip": "Skip",
-    "delete_tnum": "Delete the new track number from the queue",
-    "delete_all_tnums": "Delete every new track number in the album",
-    "delete_field": "Delete this field from the queue",
+    "always_skip": "Always skip (mark with '# OK')",
 }
 
 # Editors that understand "editor +N file" to open at line N (1-indexed).
 LINE_JUMP_EDITORS = {
     "vi", "vim", "nvim", "gvim", "mvim", "nano", "pico", "emacs"
 }
-
-
-def check_options(*middle):
-    """Build an ordered {key: label} menu for prompt_action: resolve
-    manually first, `middle` action(s) (if any) next, skip last."""
-    keys = ("manual", *middle, "skip")
-    return {key: CHECK_OPTIONS[key] for key in keys}
 
 
 def warn(msg):
@@ -141,14 +132,14 @@ def missing_package(display_name, pip_name, reason):
     note(f"{display_name} not installed (pip install {pip_name}) -- {reason}")
 
 
-def prompt_action(message, options):
-    """Print `message` as a warning, then a numbered menu from `options`
-    (an ordered {key: label} mapping), and return the chosen key. Falls
-    back to "skip" if stdin has no input left to give."""
+def prompt_action(message):
+    """Print `message` as a warning, then a numbered menu from
+    CHECK_OPTIONS, and return the chosen key. Falls back to "skip" if
+    stdin has no input left to give."""
     print(f"  ! {message}")
-    keys = list(options)
+    keys = list(CHECK_OPTIONS)
     for i, key in enumerate(keys, 1):
-        print(f"      {i}) {options[key]}")
+        print(f"      {i}) {CHECK_OPTIONS[key]}")
     while True:
         try:
             choice = input(f"    Choice [1-{len(keys)}]: ").strip()
@@ -987,32 +978,33 @@ def line_has_ok_comment(lines, index):
     return bool(re.search(r"# OK\b", lines[index], re.IGNORECASE))
 
 
-def delete_field_line(lines, file, key):
-    """Remove the raw line for `key` within `file`'s entry, in place."""
-    i = find_field_line(lines, file, key)
-    if i is not None:
-        del lines[i]
+def add_ok_comment(lines, index):
+    """Append a trailing '# OK' comment to lines[index], in place, so
+    future --check runs treat it as already reviewed."""
+    if not line_has_ok_comment(lines, index):
+        lines[index] += "  # OK"
 
 
-def clear_tracknumber(lines, file, fields):
-    """Delete the queued tracknumber field for `file`, in the raw queue
-    text and in the parsed `fields`, in place."""
-    delete_field_line(lines, file, "tracknumber")
-    del fields["tracknumber"]
-
-
-def resolve_warning(lines, message, ok_lines, options, restart_line):
+def resolve_warning(lines, stats, message, ok_lines, restart_line):
     """Print `message` as a check warning. If any line index in
     `ok_lines` carries a trailing "# OK" comment, treat it as already
-    reviewed: print and return None. Otherwise prompt with `options`
-    and return the chosen action key -- "manual" raises RestartCheck
-    at `restart_line` directly rather than returning."""
+    reviewed: print and return None. Otherwise prompt with
+    CHECK_OPTIONS and return the chosen action key -- "manual" raises
+    RestartCheck at `restart_line` directly rather than returning, and
+    "always_skip" appends a "# OK" comment to every line in `ok_lines`
+    so future --check runs skip this warning automatically."""
     if any(line_has_ok_comment(lines, i) for i in ok_lines):
         print(f"  ! {message}")
         return None
-    action = prompt_action(message, options)
+    action = prompt_action(message)
     if action == "manual":
         raise RestartCheck(restart_line)
+    if action == "always_skip":
+        for i in ok_lines:
+            if i is not None:
+                add_ok_comment(lines, i)
+        stats.changed = True
+        stats.resolved += 1
     return action
 
 
@@ -1078,16 +1070,7 @@ def check_partial_track_numbers(lines, stats, album_dir, group):
         f"were given a new track number."
     )
     entry_line = find_entry_line(lines, group[0][0])
-    action = resolve_warning(
-        lines, message, [entry_line],
-        check_options("delete_all_tnums"), entry_line,
-    )
-    if action == "delete_all_tnums":
-        for file, fields in group:
-            if "tracknumber" in fields:
-                clear_tracknumber(lines, file, fields)
-                stats.changed = True
-        stats.resolved += 1
+    resolve_warning(lines, stats, message, [entry_line], entry_line)
 
 
 def check_track_number_gaps(lines, stats, album_dir, group):
@@ -1112,7 +1095,7 @@ def check_track_number_gaps(lines, stats, album_dir, group):
         f"{track_nums[0]} and {track_nums[-1]} in the queue."
     )
     entry_line = find_entry_line(lines, group[0][0])
-    resolve_warning(lines, message, [entry_line], check_options(), entry_line)
+    resolve_warning(lines, stats, message, [entry_line], entry_line)
 
 
 def check_duplicate_fields(lines, stats, album_dir, group):
@@ -1129,9 +1112,7 @@ def check_duplicate_fields(lines, stats, album_dir, group):
             dupe_lines = [
                 find_field_line(lines, file, key) for file in dupe_files
             ]
-            resolve_warning(
-                lines, message, dupe_lines, check_options(), dupe_lines[0],
-            )
+            resolve_warning(lines, stats, message, dupe_lines, dupe_lines[0])
 
 
 def check_inconsistent_totals(lines, stats, album_dir, group):
@@ -1154,9 +1135,7 @@ def check_inconsistent_totals(lines, stats, album_dir, group):
         find_field_line(lines, f, "tracknumber")
         for files in totals.values() for f, _v in files
     ]
-    resolve_warning(
-        lines, message, total_lines, check_options(), total_lines[0],
-    )
+    resolve_warning(lines, stats, message, total_lines, total_lines[0])
 
 
 def check_inconsistent_fields(lines, stats, album_dir, group):
@@ -1180,9 +1159,7 @@ def check_inconsistent_fields(lines, stats, album_dir, group):
             find_field_line(lines, f, key)
             for files in variants.values() for f, _v in files
         ]
-        resolve_warning(
-            lines, message, variant_lines, check_options(), variant_lines[0],
-        )
+        resolve_warning(lines, stats, message, variant_lines, variant_lines[0])
 
 
 ALBUM_CHECKS = (
@@ -1196,8 +1173,7 @@ ALBUM_CHECKS = (
 
 def check_null_and_blank_fields(lines, stats, file, fields):
     """Warn about any field that's null (recognition couldn't
-    determine it) or a blank/whitespace-only string, offering to
-    delete it from the queue."""
+    determine it) or a blank/whitespace-only string."""
     for key, value in list(fields.items()):
         if value is None:
             message = (
@@ -1214,21 +1190,12 @@ def check_null_and_blank_fields(lines, stats, file, fields):
 
         stats.warnings += 1
         field_line = find_field_line(lines, file, key)
-        action = resolve_warning(
-            lines, message, [field_line],
-            check_options("delete_field"), field_line,
-        )
-        if action == "delete_field":
-            delete_field_line(lines, file, key)
-            del fields[key]
-            stats.changed = True
-            stats.resolved += 1
+        resolve_warning(lines, stats, message, [field_line], field_line)
 
 
 def check_track_number_value(lines, stats, file, fields, group):
     """Validate the tracknumber field: must be an integer, not larger
-    than the album's queued track count, and not 0 -- each violation
-    offers to delete the field outright."""
+    than the album's queued track count, and not 0."""
     raw_track = fields.get("tracknumber")
     if raw_track is None:
         return
@@ -1239,14 +1206,7 @@ def check_track_number_value(lines, stats, file, fields, group):
         message = (
             f"{file}: track number is not an integer: {raw_track!r}."
         )
-        action = resolve_warning(
-            lines, message, [tnum_line],
-            check_options("delete_tnum"), tnum_line,
-        )
-        if action == "delete_tnum":
-            clear_tracknumber(lines, file, fields)
-            stats.changed = True
-            stats.resolved += 1
+        resolve_warning(lines, stats, message, [tnum_line], tnum_line)
         return
 
     if raw_track > len(group):
@@ -1255,15 +1215,7 @@ def check_track_number_value(lines, stats, file, fields, group):
             f"{file}: track number {raw_track} is greater than the "
             f"{len(group)} occurrence(s) of this album in the queue."
         )
-        action = resolve_warning(
-            lines, message, [tnum_line],
-            check_options("delete_tnum"), tnum_line,
-        )
-        if action == "delete_tnum":
-            clear_tracknumber(lines, file, fields)
-            stats.changed = True
-            stats.resolved += 1
-            return
+        resolve_warning(lines, stats, message, [tnum_line], tnum_line)
 
     if raw_track == 0:
         stats.warnings += 1
@@ -1271,14 +1223,7 @@ def check_track_number_value(lines, stats, file, fields, group):
             f"{file}: track number is 0, which usually means it's "
             f"unset."
         )
-        action = resolve_warning(
-            lines, message, [tnum_line],
-            check_options("delete_tnum"), tnum_line,
-        )
-        if action == "delete_tnum":
-            clear_tracknumber(lines, file, fields)
-            stats.changed = True
-            stats.resolved += 1
+        resolve_warning(lines, stats, message, [tnum_line], tnum_line)
 
 
 def check_filename_match(lines, stats, file, fields):
@@ -1322,7 +1267,7 @@ def check_filename_match(lines, stats, file, fields):
         find_field_line(lines, file, "title") if title is not None else None,
     ]
     restart_line = find_entry_line(lines, file)
-    resolve_warning(lines, message, ok_lines, check_options(), restart_line)
+    resolve_warning(lines, stats, message, ok_lines, restart_line)
 
 
 def check_title_track_prefix(lines, stats, file, fields):
@@ -1343,7 +1288,7 @@ def check_title_track_prefix(lines, stats, file, fields):
         f"{title!r}."
     )
     title_line = find_field_line(lines, file, "title")
-    resolve_warning(lines, message, [title_line], check_options(), title_line)
+    resolve_warning(lines, stats, message, [title_line], title_line)
 
 
 def check_title_matches_other_field(lines, stats, file, fields):
@@ -1367,9 +1312,7 @@ def check_title_matches_other_field(lines, stats, file, fields):
         f"({other_value!r}) almost exactly -- possible wrong match."
     )
     title_line = find_field_line(lines, file, "title")
-    resolve_warning(
-        lines, message, [title_line], check_options(), title_line,
-    )
+    resolve_warning(lines, stats, message, [title_line], title_line)
 
 
 def check_artist_matches_artists(lines, stats, file, fields):
@@ -1393,7 +1336,7 @@ def check_artist_matches_artists(lines, stats, file, fields):
         find_field_line(lines, file, "artists"),
     ]
     restart_line = find_entry_line(lines, file)
-    resolve_warning(lines, message, ok_lines, check_options(), restart_line)
+    resolve_warning(lines, stats, message, ok_lines, restart_line)
 
 
 def write_queue_lines(queue_file, lines):
@@ -1404,8 +1347,8 @@ def write_queue_lines(queue_file, lines):
 def run_check(queue_file):
     """Scan a previously generated queue file for likely mistakes,
     interactively asking what to do about each one found: resolve it by
-    hand, leave it as-is, or delete the offending field/entry. Makes no
-    API calls, needs no root -- every check is derived from the YAML
+    hand, leave it as-is, or mark it to always be skipped. Makes no API
+    calls, needs no root -- every check is derived from the YAML
     alone."""
     with open(queue_file, encoding="utf-8") as f:
         raw_text = f.read()
@@ -1473,8 +1416,8 @@ def build_arg_parser():
         "--check", metavar="FILE",
         help="Scan a previously queued changes file (see --queue) for "
              "likely mistakes, interactively asking what to do about each "
-             "one found (resolve by hand in $EDITOR, do nothing, or "
-             "delete the offending field), then exit. No API calls, "
+             "one found (resolve by hand in $EDITOR, skip once, or always "
+             "skip by marking it '# OK'), then exit. No API calls, "
              "no root needed.",
     )
 
