@@ -1372,6 +1372,30 @@ def check_title_matches_other_field(lines, stats, file, fields):
     )
 
 
+def check_artist_matches_artists(lines, stats, file, fields):
+    """Warn if the queued artist doesn't match the first entry in the
+    queued artists array -- the folder-trusted artist and the
+    recording's main credited artist should normally agree."""
+    artist = fields.get("artist")
+    artists = fields.get("artists")
+    if not artist or not artists:
+        return
+    if str(artists[0]).strip() == str(artist).strip():
+        return
+
+    stats.warnings += 1
+    message = (
+        f"{file}: artist {artist!r} doesn't match the first entry in "
+        f"artists {artists!r}."
+    )
+    ok_lines = [
+        find_field_line(lines, file, "artist"),
+        find_field_line(lines, file, "artists"),
+    ]
+    restart_line = find_entry_line(lines, file)
+    resolve_warning(lines, message, ok_lines, check_options(), restart_line)
+
+
 def write_queue_lines(queue_file, lines):
     with open(queue_file, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -1405,6 +1429,7 @@ def run_check(queue_file):
                 check_filename_match(lines, stats, file, fields)
                 check_title_track_prefix(lines, stats, file, fields)
                 check_title_matches_other_field(lines, stats, file, fields)
+                check_artist_matches_artists(lines, stats, file, fields)
     except RestartCheck as restart:
         if stats.changed:
             write_queue_lines(queue_file, lines)
