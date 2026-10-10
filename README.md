@@ -43,7 +43,7 @@ And to optionally run tests:
 pip install pytest && pytest tests
 ```
 
-### Optional Features
+### Environment Variables for Specific Features
 
 - `MMF_MUSICBRAINZ_CONTACT`: your email, sent to MusicBrainz (required
   for `music_metafix scan`).
