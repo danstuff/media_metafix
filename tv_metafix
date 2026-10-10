@@ -1,0 +1,1158 @@
+#!/usr/bin/env python3
+"""
+Verify and fix metadata for a video library. Each folder under root is
+either a show or a movie series (a root may mix both):
+
+    <root>/<show>/<season>/<episode>.<ext>    TV episodes
+    <root>/<series>/<title>.<ext>             movies
+
+Folder names are trusted for show/season and series. Episode titles and
+numbers come from TVmaze; movie titles and years from TMDB, falling
+back to the filename. Missing subtitles come from OpenSubtitles.
+
+scan only queues changes: metadata to tmp/changes.yml and subtitles to
+tmp/subtitles (tmp is relative to the current directory, not root).
+Steps that modify files take --dry-run to print what they'd change
+instead. A ".mmfignore" file in root (".gitignore" syntax) excludes
+matches from every step.
+
+See README.md for setup and examples.
+"""
+
+import argparse
+import glob
+import os
+import re
+import struct
+import sys
+from collections import Counter
+from datetime import date
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+
+from common import check as chk
+from common.cli import (
+    DEFAULT_TMP_DIR, SCANNED_ROOT_HELP, add_check_parser, add_convert_parser,
+    add_dir_arg, add_dry_run_arg, add_queue_arg, add_root_arg, build_parser,
+    run_step,
+)
+from common.ffmpeg import (
+    ffprobe_json, replace_with, require_ffmpeg, run_ffmpeg,
+    temp_output_path,
+)
+from common.files import (
+    iter_dirs, iter_files, iter_kept, iter_queued_files, load_mmfignore,
+    move, rename_target, with_extension,
+)
+from common.http import cached, fetch, fetch_json
+from common.queue import (
+    apply_queue, build_queue_fields, load_queue, print_scan_summary,
+    scan_to_queue, verify_queue_root,
+)
+from common.steps import convert_extensions, process_each
+from common.text import (
+    FUZZY_SAME_ENOUGH, best_fuzzy_match, fuzzy_ratio, leading_int,
+    render_filename, should_replace,
+)
+from common.ui import note, outcome, report, warn, warn_missing_file
+
+USER_AGENT = "tv-metafix v0.1"
+
+VIDEO_EXTENSIONS = {
+    ".mkv", ".mp4", ".m4v", ".mov", ".avi", ".wmv", ".webm", ".mpg",
+    ".mpeg", ".ts",
+}
+# Containers without a "collection" tag.
+ALBUM_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi"}
+
+EPISODE_FIELDS = ("show", "season", "episode", "title")
+MOVIE_FIELDS = ("series", "title", "year")
+INT_FIELDS = {"season", "episode", "year"}
+
+# Queue field -> container tag.
+TAG_KEYS = {
+    "show": "show", "season": "season_number", "episode": "episode_sort",
+    "title": "title", "series": "collection", "year": "date",
+}
+ALBUM_TAG_KEYS = dict(TAG_KEYS, series="album")
+
+DEFAULT_SUBTITLES_DIR = str(Path(DEFAULT_TMP_DIR) / "subtitles")
+
+
+# ---------------------------------------------------------------------------
+# Library layout
+# ---------------------------------------------------------------------------
+
+def is_video(path):
+    return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def kind_of(rel_path):
+    """"episode" for show/season/file, "movie" for series/file."""
+    return "episode" if len(Path(rel_path).parts) == 3 else "movie"
+
+
+def fields_for(kind):
+    return EPISODE_FIELDS if kind == "episode" else MOVIE_FIELDS
+
+
+def iter_videos(root):
+    """Every non-ignored video at movie or episode depth."""
+    root = Path(root)
+    spec = load_mmfignore(root)
+    for top in iter_kept(spec, root, iter_dirs(root)):
+        yield from iter_kept(spec, root, filter(is_video, iter_files(top)))
+        for season in iter_kept(spec, root, iter_dirs(top)):
+            files = filter(is_video, iter_files(season))
+            yield from iter_kept(spec, root, files)
+
+
+# ---------------------------------------------------------------------------
+# Name parsing
+# ---------------------------------------------------------------------------
+
+SEASON_DIR_RE = re.compile(
+    r"^\s*(?:season|series|s)?[\s._-]*0*(\d{1,3})\s*$", re.IGNORECASE,
+)
+SPECIALS_DIR_RE = re.compile(r"^\s*specials?\s*$", re.IGNORECASE)
+# "S01E03", "s1.e3", "1x03"
+SEASON_EPISODE_RE = re.compile(
+    r"\bs(\d{1,2})[\s._-]*e(\d{1,3})\b|\b(\d{1,2})x(\d{2,3})\b",
+    re.IGNORECASE,
+)
+# "03 - Title", "E03 Title", "Episode 3" -- not 4-digit years.
+EPISODE_PREFIX_RE = re.compile(
+    r"^\s*(?:e|ep|episode)?[\s._-]*0*(\d{1,3})\b[\s._-]*", re.IGNORECASE,
+)
+MOVIE_YEAR_RE = re.compile(r"[\s._-]*[(\[]((?:18|19|20)\d{2})[)\]]\s*$")
+SEPARATORS = " ._-"
+
+
+def season_from_dir(name):
+    """Season number from a folder like "Season 02" or "Specials"."""
+    if SPECIALS_DIR_RE.match(name):
+        return 0
+    match = SEASON_DIR_RE.match(name)
+    return int(match.group(1)) if match else None
+
+
+def season_episode_from_name(stem):
+    """(season, episode) from an "S01E03"/"1x03" token, or None."""
+    match = SEASON_EPISODE_RE.search(stem)
+    if not match:
+        return None
+    season, episode = match.group(1, 2) if match.group(1) else \
+        match.group(3, 4)
+    return int(season), int(episode)
+
+
+def episode_from_name(stem):
+    """Episode number from a filename stem, or None."""
+    pair = season_episode_from_name(stem)
+    if pair:
+        return pair[1]
+    match = EPISODE_PREFIX_RE.match(stem)
+    return int(match.group(1)) if match else None
+
+
+def strip_episode_number(stem):
+    """"Show - S01E03 - Title" / "03 - Title" -> "Title"."""
+    match = SEASON_EPISODE_RE.search(stem)
+    if match:
+        return stem[match.end():].strip(SEPARATORS)
+    return EPISODE_PREFIX_RE.sub("", stem).strip(SEPARATORS)
+
+
+def year_from_name(stem):
+    match = MOVIE_YEAR_RE.search(stem)
+    return int(match.group(1)) if match else None
+
+
+def strip_year(stem):
+    """"Title (2001)" -> "Title"."""
+    return MOVIE_YEAR_RE.sub("", stem).strip()
+
+
+def guess_fields(rel_path):
+    """Fields implied by the folder structure and filename alone."""
+    path = Path(rel_path)
+    if kind_of(rel_path) == "movie":
+        return {
+            "series": path.parent.name,
+            "title": strip_year(path.stem),
+            "year": year_from_name(path.stem),
+        }
+    return {
+        "show": path.parent.parent.name,
+        "season": season_from_dir(path.parent.name),
+        "episode": episode_from_name(path.stem),
+        "title": strip_episode_number(path.stem) or None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tag I/O via ffprobe/ffmpeg
+# ---------------------------------------------------------------------------
+
+def tag_keys(path):
+    return ALBUM_TAG_KEYS if path.suffix.lower() in ALBUM_EXTENSIONS \
+        else TAG_KEYS
+
+
+def read_tags(path):
+    """{queue field: value} from `path`'s container tags."""
+    raw = ffprobe_json(path).get("format", {}).get("tags", {})
+    raw = {k.lower(): v for k, v in raw.items()}
+    # ffmpeg writes AVI "album" as IPRD but reads it back as "product".
+    raw.setdefault("album", raw.get("product"))
+    tags = {}
+    for field, key in tag_keys(path).items():
+        value = raw.get(key)
+        if field in INT_FIELDS:
+            value = leading_int(value)
+        tags[field] = value
+    return tags
+
+
+def metadata_args(path, fields):
+    args = []
+    for field, key in tag_keys(path).items():
+        if fields.get(field) is not None:
+            args += ["-metadata", f"{key}={fields[field]}"]
+    return args
+
+
+def remux(path, extra_args, new_suffix=None, extra_inputs=()):
+    """Copy `path`'s streams through ffmpeg with `extra_args`,
+    replacing it. Returns the final path."""
+    tmp_out = temp_output_path(path, new_suffix)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path)]
+    for extra in extra_inputs:
+        cmd += ["-i", str(extra)]
+    cmd += ["-map", "0", "-map_metadata", "0", "-c", "copy"]
+    cmd += extra_args + [str(tmp_out)]
+    run_ffmpeg(cmd, tmp_out)
+    return replace_with(path, tmp_out, new_suffix)
+
+
+def unsaved_fields(path, fields):
+    """Fields whose value didn't survive being written to `path`."""
+    tags = read_tags(path)
+    return [
+        k for k, v in fields.items()
+        if v is not None and str(tags.get(k)) != str(v).strip()
+    ]
+
+
+def write_tags(path, fields):
+    args = metadata_args(path, fields)
+    if not args:
+        return
+    remux(path, args)
+    unsaved = unsaved_fields(path, fields)
+    if unsaved:
+        warn(f"{path.suffix} can't store {', '.join(unsaved)} for {path} "
+             f"-- try `convert` to .mkv.")
+
+
+# ---------------------------------------------------------------------------
+# Lookups: TVmaze (episodes) and TMDB (movies)
+# ---------------------------------------------------------------------------
+
+TVMAZE_SEARCH_URL = "https://api.tvmaze.com/singlesearch/shows"
+TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
+
+
+def tvmaze_episodes(show):
+    """(TVmaze's show name, {(season, episode): title}), or None."""
+    try:
+        data = fetch_json(
+            TVMAZE_SEARCH_URL, {"q": show, "embed": "episodes"},
+            {"User-Agent": USER_AGENT},
+        )
+    except HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+    episodes = data.get("_embedded", {}).get("episodes", [])
+    titles = {
+        (ep["season"], ep["number"]): ep["name"]
+        for ep in episodes if ep.get("number") is not None
+    }
+    return data.get("name"), titles
+
+
+def tmdb_movie(title, year, api_key):
+    """{"title", "year"} of TMDB's best match, or None."""
+    params = {"query": title, "api_key": api_key}
+    if year:
+        params["year"] = year
+    results = fetch_json(TMDB_SEARCH_URL, params).get("results") or []
+    if not results:
+        return None
+    best = results[0]
+    return {
+        "title": best.get("title"),
+        "year": leading_int((best.get("release_date") or "")[:4]),
+    }
+
+
+def show_episodes(show, args, cache):
+    """{(season, episode): title} for `show`, or None."""
+    if args.no_tvmaze:
+        return None
+    result = cached(
+        cache, ("tvmaze", show), lambda: tvmaze_episodes(show),
+        f"TVmaze lookup for {show!r}",
+    )
+    if result is None:
+        return None
+    name, titles = result
+    if fuzzy_ratio(name, show) < FUZZY_SAME_ENOUGH:
+        warn(f"TVmaze matched {name!r} for folder {show!r}.")
+    return titles
+
+
+def match_episode(guess, titles):
+    """(season, episode, title) from `titles` for a guessed episode,
+    by number or else fuzzy title, or None."""
+    season = guess["season"]
+    key = (season, guess["episode"])
+    if key in titles:
+        return (*key, titles[key])
+    if not guess["title"]:
+        return None
+    in_season = {k: t for k, t in titles.items() if k[0] == season}
+    best = best_fuzzy_match(in_season, guess["title"])
+    return (*best, titles[best]) if best else None
+
+
+def match_movie(guess, args, cache):
+    """TMDB's {"title", "year"} for a guessed movie, or None."""
+    if not args.tmdb_api_key:
+        return None
+    title, year = guess["title"], guess["year"]
+    return cached(
+        cache, ("tmdb", title, year),
+        lambda: tmdb_movie(title, year, args.tmdb_api_key),
+        f"TMDB lookup for {title!r}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# scan
+# ---------------------------------------------------------------------------
+
+def differs(field, new, current):
+    if new is None:
+        return False
+    if field in INT_FIELDS:
+        return new != current
+    return should_replace(str(new), current)
+
+
+def queue_differences(updates, current, found):
+    """Add each `found` field that differs from `current`."""
+    for field, value in found.items():
+        if differs(field, value, current.get(field)):
+            updates[field] = value
+
+
+def episode_updates(path, guess, current, args, cache):
+    updates = {}
+    queue_differences(updates, current, {
+        "show": guess["show"], "season": guess["season"],
+    })
+    titles = show_episodes(guess["show"], args, cache)
+    match = match_episode(guess, titles) if titles else None
+    if match:
+        _season, episode, title = match
+        found = {"episode": episode, "title": title}
+    else:
+        warn(f"No TVmaze match found for {path}")
+        found = {"episode": guess["episode"]}
+    queue_differences(updates, current, found)
+    return updates
+
+
+def movie_updates(path, guess, current, args, cache):
+    updates = {}
+    queue_differences(updates, current, {"series": guess["series"]})
+    match = match_movie(guess, args, cache)
+    if not match:
+        warn(f"No TMDB match found for {path}, using its filename.")
+    queue_differences(updates, current, match or guess)
+    return updates
+
+
+def compute_scan_change(root, path, args, cache):
+    """None, or (file, fields, previous) for `path`'s queue entry."""
+    file = str(path.relative_to(root))
+    kind = kind_of(file)
+    guess = guess_fields(file)
+    current = read_tags(path)
+    compute = episode_updates if kind == "episode" else movie_updates
+    updates = compute(path, guess, current, args, cache)
+    if not updates:
+        return None
+    fields, previous = build_queue_fields(current, updates, fields_for(kind))
+    return file, fields, previous
+
+
+def run_scan(args):
+    """Queue changes for every video, and download subtitles unless
+    --no-subs."""
+    if not require_ffmpeg("read tags"):
+        return
+    if not args.tmdb_api_key:
+        note("no TMDB API key -- movie titles come from filenames.")
+    # Checked first, so a bad --sub-lang fails before the slow part.
+    subtitles = None if args.no_subs else subtitle_setup(args)
+    root = Path(args.root)
+    cache = {}
+    counts = scan_to_queue(
+        args, iter_videos(root),
+        lambda path: compute_scan_change(root, path, args, cache),
+        "Video",
+    )
+    if subtitles:
+        queue_subtitles(root, *subtitles, args.subs_dir)
+    print_scan_summary(counts, args)
+
+
+# ---------------------------------------------------------------------------
+# OpenSubtitles: file hashes and subtitles
+# ---------------------------------------------------------------------------
+
+OPENSUBTITLES_URL = "https://api.opensubtitles.com/api/v1"
+OSHASH_CHUNK = 64 * 1024
+
+
+def oshash(path):
+    """OpenSubtitles' file hash: size plus the 64-bit sums of the first
+    and last 64 KiB."""
+    size = path.stat().st_size
+    if size < OSHASH_CHUNK * 2:
+        raise ValueError("file too small to hash")
+    total = size
+    with open(path, "rb") as f:
+        for offset in (0, size - OSHASH_CHUNK):
+            f.seek(offset)
+            words = struct.unpack("<8192Q", f.read(OSHASH_CHUNK))
+            total += sum(words)
+    return f"{total & 0xFFFFFFFFFFFFFFFF:016x}"
+
+
+class OpenSubtitles:
+    def __init__(self, api_key, token=None):
+        self.api_key = api_key
+        self.token = token
+
+    def headers(self):
+        headers = {"Api-Key": self.api_key, "User-Agent": USER_AGENT}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def call(self, endpoint, params=None, body=None):
+        return fetch_json(
+            f"{OPENSUBTITLES_URL}/{endpoint}", params, self.headers(), body,
+        )
+
+    def login(self, username, password):
+        self.token = self.call(
+            "login", body={"username": username, "password": password},
+        )["token"]
+
+    def languages(self):
+        """{lowercased code: code} of every subtitle language."""
+        data = self.call("infos/languages").get("data", [])
+        return {d["language_code"].lower(): d["language_code"] for d in data}
+
+    def search(self, **params):
+        return self.call("subtitles", {
+            k: v for k, v in params.items() if v is not None
+        }).get("data", [])
+
+    def download(self, file_id):
+        link = self.call("download", body={"file_id": file_id})["link"]
+        return fetch(link, headers={"User-Agent": USER_AGENT})
+
+
+def opensubtitles_client(args):
+    """An OpenSubtitles client, logged in if credentials are set, or
+    None if there's no API key."""
+    if not args.opensubtitles_api_key:
+        note(
+            "no OpenSubtitles API key (--opensubtitles-api-key or "
+            "$TMF_OPENSUBTITLES_API_KEY)."
+        )
+        return None
+    client = OpenSubtitles(args.opensubtitles_api_key)
+    username = getattr(args, "opensubtitles_username", None)
+    if username:
+        client.login(username, args.opensubtitles_password)
+    return client
+
+
+# ---------------------------------------------------------------------------
+# fingerprint
+# ---------------------------------------------------------------------------
+
+FINGERPRINT_TITLE_THRESHOLD = 0.5   # deliberately low: a sanity check
+
+
+def hash_matches(client, path):
+    """feature_details of every subtitle matched by `path`'s hash."""
+    results = client.search(moviehash=oshash(path))
+    return [
+        r["attributes"]["feature_details"] for r in results
+        if r["attributes"].get("moviehash_match")
+    ]
+
+
+def feature_agrees(feature, fields):
+    """True if OpenSubtitles' `feature` fits the queued `fields`."""
+    if fields.get("episode") is not None:
+        if (feature.get("season_number"), feature.get("episode_number")) \
+                != (fields.get("season"), fields.get("episode")):
+            return False
+    title = fields.get("title")
+    return not title or fuzzy_ratio(
+        feature.get("title"), str(title),
+    ) >= FINGERPRINT_TITLE_THRESHOLD
+
+
+def describe_feature(feature):
+    if feature.get("episode_number") is not None:
+        return (
+            f"S{feature.get('season_number')}E"
+            f"{feature.get('episode_number')} {feature.get('title')!r}"
+        )
+    return f"{feature.get('title')!r} ({feature.get('year')})"
+
+
+def fingerprint_one_file(client, root, file, fields):
+    """"skipped", "unknown", "ok" or "mismatch" for one entry."""
+    path = root / file
+    if not path.exists():
+        warn_missing_file(path)
+        return "skipped"
+    try:
+        features = hash_matches(client, path)
+    except (HTTPError, URLError, OSError, ValueError, KeyError) as exc:
+        warn(f"Hash lookup failed for {file}: {exc}")
+        return "skipped"
+    if not features:
+        return "unknown"
+    if any(feature_agrees(f, fields) for f in features):
+        return "ok"
+    warn(f"{file}: queued entry doesn't match its file hash "
+         f"(OpenSubtitles says {describe_feature(features[0])}).")
+    return "mismatch"
+
+
+def run_fingerprint(args):
+    """Warn about queue entries OpenSubtitles' hash lookup disagrees
+    with. Only exact, known releases can be identified."""
+    client = opensubtitles_client(args)
+    if client is None:
+        return
+    root = Path(args.root)
+    counts = Counter(
+        fingerprint_one_file(client, root, file, fields)
+        for file, fields in load_queue(args.queue).items()
+    )
+    print(
+        f"\n{counts['ok'] + counts['mismatch']} file(s) identified, "
+        f"{counts['mismatch']} mismatch(es), {counts['unknown']} "
+        f"unknown, {counts['skipped']} skipped."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subtitles: `scan` downloads them to tmp/subtitles, mirroring root;
+# `apply` embeds them.
+# ---------------------------------------------------------------------------
+
+# ISO 639-1 -> ISO 639-2 codes (first is written; any is recognized).
+LANGUAGE_CODES = {
+    "af": ("afr",), "an": ("arg",), "ar": ("ara",), "as": ("asm",),
+    "az": ("aze",), "be": ("bel",), "bg": ("bul",), "bn": ("ben",),
+    "br": ("bre",), "bs": ("bos",), "ca": ("cat",), "cs": ("cze", "ces"),
+    "cy": ("wel", "cym"), "da": ("dan",), "de": ("ger", "deu"),
+    "el": ("gre", "ell"), "en": ("eng",), "eo": ("epo",), "es": ("spa",),
+    "et": ("est",), "eu": ("baq", "eus"), "fa": ("per", "fas"),
+    "fi": ("fin",), "fr": ("fre", "fra"), "ga": ("gle",), "gd": ("gla",),
+    "gl": ("glg",), "he": ("heb",), "hi": ("hin",), "hr": ("hrv",),
+    "hu": ("hun",), "hy": ("arm", "hye"), "ia": ("ina",), "id": ("ind",),
+    "ig": ("ibo",), "is": ("ice", "isl"), "it": ("ita",), "ja": ("jpn",),
+    "ka": ("geo", "kat"), "kk": ("kaz",), "km": ("khm",), "kn": ("kan",),
+    "ko": ("kor",), "ku": ("kur",), "lb": ("ltz",), "lt": ("lit",),
+    "lv": ("lav",), "mk": ("mac", "mkd"), "ml": ("mal",), "mn": ("mon",),
+    "mr": ("mar",), "ms": ("may", "msa"), "my": ("bur", "mya"),
+    "nb": ("nob",), "ne": ("nep",), "nl": ("dut", "nld"), "nn": ("nno",),
+    "no": ("nor",), "oc": ("oci",), "or": ("ori",), "pa": ("pan",),
+    "pl": ("pol",), "ps": ("pus",), "pt": ("por",), "ro": ("rum", "ron"),
+    "ru": ("rus",), "sd": ("snd",), "si": ("sin",), "sk": ("slo", "slk"),
+    "sl": ("slv",), "so": ("som",), "sq": ("alb", "sqi"), "sr": ("srp",),
+    "sv": ("swe",), "sw": ("swa",), "ta": ("tam",), "te": ("tel",),
+    "th": ("tha",), "tk": ("tuk",), "tl": ("tgl",), "tr": ("tur",),
+    "tt": ("tat",), "uk": ("ukr",), "ur": ("urd",), "uz": ("uzb",),
+    "vi": ("vie",), "zh": ("chi", "zho"),
+}
+# Subtitle codec to embed as, per container; others get a sidecar .srt.
+SUBTITLE_CODECS = {
+    ".mkv": "srt", ".mp4": "mov_text", ".m4v": "mov_text",
+    ".mov": "mov_text", ".webm": "webvtt",
+}
+
+
+# Language tags meaning "unknown"; such subtitles count as present.
+UNTAGGED = {"", "und"}
+SUBTITLE_EXTENSIONS = (".srt", ".ass", ".ssa", ".vtt", ".sub")
+
+
+# OpenSubtitles' codes: ISO 639-1, sometimes with a region ("pt-BR").
+SUB_LANG_RE = re.compile(r"([a-z]{2})(?:-([a-z]{2}))?", re.IGNORECASE)
+
+
+def subtitle_language(text):
+    """argparse type: "PT-br" -> "pt-BR"; rejects other shapes."""
+    match = SUB_LANG_RE.fullmatch(text.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} isn't an OpenSubtitles language code "
+            f"(e.g. en, fr, pt-BR)"
+        )
+    base, region = match.groups()
+    return base.lower() + (f"-{region.upper()}" if region else "")
+
+
+def base_language(lang):
+    """"pt-BR" -> "pt"."""
+    return lang.split("-")[0].lower()
+
+
+def language_codes(lang):
+    """Every tag `lang` subtitles might carry: "pt-BR" -> ("pt-BR",
+    "pt", "por")."""
+    base = base_language(lang)
+    return (lang, base, *LANGUAGE_CODES.get(base, ()))
+
+
+def iso639_2(lang):
+    base = base_language(lang)
+    return LANGUAGE_CODES.get(base, (base,))[0]
+
+
+def subtitle_streams(path):
+    return [
+        s for s in ffprobe_json(path).get("streams", [])
+        if s.get("codec_type") == "subtitle"
+    ]
+
+
+def sidecar_subtitles(path):
+    """Subtitle files named after `path`, e.g. "<stem>.srt" or
+    "<stem>.en.srt"."""
+    stem = glob.escape(path.stem)
+    return sorted({
+        sidecar
+        for ext in SUBTITLE_EXTENSIONS
+        for pattern in (f"{stem}{ext}", f"{stem}.*{ext}")
+        for sidecar in path.parent.glob(pattern)
+    })
+
+
+def sidecar_language(sidecar, video):
+    """"en" for "<stem>.en.srt"; "" for "<stem>.srt"."""
+    return sidecar.name[len(video.stem):-len(sidecar.suffix)].lstrip(".")
+
+
+def has_subtitles(path, lang):
+    """True if `path` has `lang` or untagged subtitles, embedded or
+    alongside. Untagged ones count, so nothing gets doubled up."""
+    accepted = {code.lower() for code in language_codes(lang)} | UNTAGGED
+    return any(
+        sidecar_language(sidecar, path).lower() in accepted
+        for sidecar in sidecar_subtitles(path)
+    ) or any(
+        (stream.get("tags", {}).get("language") or "").lower() in accepted
+        for stream in subtitle_streams(path)
+    )
+
+
+def search_params(path, root):
+    """OpenSubtitles search params from tags, else the path."""
+    file = str(path.relative_to(root))
+    tags = read_tags(path)
+    fields = {
+        k: tags.get(k) or v for k, v in guess_fields(file).items()
+    }
+    if kind_of(file) == "movie":
+        return {"query": fields["title"], "year": fields["year"],
+                "type": "movie"}
+    return {
+        "query": fields["show"], "season_number": fields["season"],
+        "episode_number": fields["episode"], "type": "episode",
+    }
+
+
+def pick_subtitle(results):
+    """file_id of the best result (hash match, then most downloaded)."""
+    ranked = sorted(results, reverse=True, key=lambda r: (
+        bool(r["attributes"].get("moviehash_match")),
+        r["attributes"].get("download_count", 0),
+    ))
+    for result in ranked:
+        files = result["attributes"].get("files") or []
+        if files:
+            return files[0]["file_id"]
+    return None
+
+
+def find_subtitle(client, path, root, lang):
+    """file_id of the best `lang` subtitle for `path`, or None."""
+    try:
+        results = client.search(languages=lang, moviehash=oshash(path))
+    except ValueError:
+        results = []
+    if not any(r["attributes"].get("moviehash_match") for r in results):
+        results += client.search(languages=lang,
+                                 **search_params(path, root))
+    return pick_subtitle(results)
+
+
+def embed_subtitle(path, srt_path, lang):
+    """Mux `srt_path` into `path` as a `lang` subtitle stream."""
+    index = len(subtitle_streams(path))
+    codec = SUBTITLE_CODECS[path.suffix.lower()]
+    remux(path, [
+        "-map", "1", f"-c:s:{index}", codec,
+        f"-metadata:s:s:{index}", f"language={iso639_2(lang)}",
+    ], extra_inputs=[srt_path])
+
+
+def save_subtitle(path, data, lang):
+    """Embed `data` in `path`, or save it alongside if the container
+    can't hold text subtitles. Returns where it went."""
+    srt_path = path.with_name(f"{path.stem}.{lang}.srt")
+    srt_path.write_bytes(data)
+    if path.suffix.lower() not in SUBTITLE_CODECS:
+        return srt_path
+    try:
+        embed_subtitle(path, srt_path, lang)
+    finally:
+        srt_path.unlink()
+    return path
+
+
+def subtitle_file(subtitles_dir, root, video, lang):
+    """Where `scan` saves `video`'s subtitles."""
+    rel_dir = video.parent.relative_to(root)
+    return Path(subtitles_dir) / rel_dir / f"{video.stem}.{lang}.srt"
+
+
+def download_subtitle(client, root, video, dest, lang):
+    """Save `video`'s best `lang` subtitles to `dest`. Returns
+    "downloaded", "present", "missing" or "error"."""
+    try:
+        if dest.exists() or has_subtitles(video, lang):
+            return "present"
+        file_id = find_subtitle(client, video, root, lang)
+        if file_id is None:
+            warn(f"No {lang} subtitles found for {video}")
+            return "missing"
+        data = client.download(file_id)
+    except (HTTPError, URLError, OSError, RuntimeError, KeyError,
+            ValueError) as exc:
+        warn(f"Subtitle download failed for {video}: {exc}")
+        return "error"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    print(f"Subtitles: {dest}")
+    return "downloaded"
+
+
+def verified_language(client, lang):
+    """`lang` as OpenSubtitles spells it. Exits if it's unsupported;
+    if the list can't be fetched, `lang` is used unchecked."""
+    try:
+        known = client.languages()
+    except (HTTPError, URLError, OSError, ValueError, KeyError) as exc:
+        warn(f"Couldn't fetch OpenSubtitles' languages ({exc}); using "
+             f"{lang!r} unchecked.")
+        return lang
+    if lang.lower() not in known:
+        sys.exit(f"Error: OpenSubtitles has no {lang!r} subtitles. Codes: "
+                 f"{', '.join(sorted(known.values()))}")
+    return known[lang.lower()]
+
+
+def subtitle_setup(args):
+    """(client, language) for downloading subtitles, or None if
+    there's no API key. Exits on an unsupported --sub-lang."""
+    client = opensubtitles_client(args)
+    if client is None:
+        return None
+    return client, verified_language(client, args.sub_lang)
+
+
+def queue_subtitles(root, client, lang, subtitles_dir):
+    """Download `lang` subtitles for every video lacking them."""
+    counts = Counter(
+        download_subtitle(
+            client, root, video,
+            subtitle_file(subtitles_dir, root, video, lang), lang,
+        )
+        for video in iter_videos(root)
+    )
+    print(
+        f"\n{counts['downloaded']} subtitle file(s) downloaded, "
+        f"{counts['present']} already present, {counts['missing']} not "
+        f"found, {counts['error']} error(s)."
+    )
+
+
+def subtitle_target(srt, dest_dir):
+    """(video, lang) for a queued "<stem>.<lang>.srt", or None."""
+    stem, _, lang = srt.name[:-len(".srt")].rpartition(".")
+    for video in filter(is_video, iter_files(dest_dir)):
+        if video.stem == stem:
+            return video, lang
+    return None
+
+
+def apply_subtitle(srt, video, lang, dry_run):
+    """Embed `srt` in `video` unless it already has `lang` subtitles.
+    Returns True if it did (or would)."""
+    if has_subtitles(video, lang):
+        print(f"Keeping existing {lang} subtitles: {video}")
+        return False
+    dest = video if dry_run else save_subtitle(video, srt.read_bytes(), lang)
+    report("subtitle", dest, dry_run)
+    return True
+
+
+def apply_subtitles(root, subtitles_dir, dry_run):
+    """Embed every queued subtitle file. Returns how many were."""
+    added = 0
+    for srt, dest_dir in iter_queued_files(subtitles_dir, root):
+        target = subtitle_target(srt, dest_dir)
+        if target is None:
+            warn(f"No video for queued subtitles: {srt}")
+            continue
+        try:
+            added += apply_subtitle(srt, *target, dry_run)
+        except (OSError, RuntimeError) as exc:
+            warn(f"Failed to add subtitles to {target[0]}: {exc}")
+    return added
+
+
+# ---------------------------------------------------------------------------
+# apply
+# ---------------------------------------------------------------------------
+
+def run_apply(args):
+    root = Path(args.root)
+    verify_queue_root(args.queue, root)
+    apply_queue(root, args.queue, write_tags, args.dry_run)
+    added = apply_subtitles(root, args.subs_dir, args.dry_run)
+    if added:
+        print(f"{added} video(s) {outcome('subtitle', args.dry_run)}.")
+
+
+# ---------------------------------------------------------------------------
+# convert
+# ---------------------------------------------------------------------------
+
+def convert_file(path, to_ext):
+    """Remux `path` into `to_ext`, keeping streams and tags."""
+    tags = read_tags(path)
+    codec = SUBTITLE_CODECS.get(to_ext)
+    args = ["-c:s", codec] if codec else ["-sn"]
+    new_path = remux(path, args, new_suffix=to_ext)
+    write_tags(new_path, tags)
+    return new_path
+
+
+def run_convert(args):
+    """Remux every `from` file under root into `to`."""
+    if not require_ffmpeg("convert"):
+        return
+    exts = convert_extensions(args)
+    if exts is None:
+        return
+    from_ext, to_ext = exts
+    process_each(
+        with_extension(iter_videos(args.root), from_ext),
+        lambda path: f"{path.name} -> {path.with_suffix(to_ext).name}",
+        lambda path: convert_file(path, to_ext),
+        "convert", "file", args.dry_run,
+    )
+
+
+# ---------------------------------------------------------------------------
+# rename
+# ---------------------------------------------------------------------------
+
+def two_digits(value):
+    return f"{value:02d}" if value is not None else "00"
+
+
+def template_values(path, tags):
+    """%placeholder values for `path` from its tags."""
+    return {
+        "%show": tags.get("show") or "",
+        "%season": two_digits(tags.get("season")),
+        "%episode": two_digits(tags.get("episode")),
+        "%title": (tags.get("title") or "").strip() or path.stem,
+        "%series": tags.get("series") or "",
+        "%year": tags.get("year") or "",
+    }
+
+
+def rename_file(path, template, dry_run=False):
+    """Rename `path` (and its sidecar subtitles) from its tags."""
+    values = template_values(path, read_tags(path))
+    new_path = rename_target(path, render_filename(template, path, values))
+    if new_path is None:
+        return
+    for sidecar in list(sidecar_subtitles(path)):
+        lang_suffix = sidecar.name[len(path.stem):]
+        move(sidecar, path.with_name(new_path.stem + lang_suffix), dry_run)
+    move(path, new_path, dry_run)
+
+
+def run_rename(args):
+    """Rename episodes/movies from their tags via their templates."""
+    if not (args.episodes or args.movies):
+        note("give --episodes and/or --movies -- nothing to do.")
+        return
+    root = Path(args.root)
+    for path in iter_videos(root):
+        kind = kind_of(path.relative_to(root))
+        template = args.episodes if kind == "episode" else args.movies
+        if template:
+            rename_file(path, template, args.dry_run)
+
+
+# ---------------------------------------------------------------------------
+# check
+# ---------------------------------------------------------------------------
+
+EPISODE = ("episode", "episode number")
+YEAR = ("year", "year")
+
+
+def check_episode_group(lines, stats, season_dir, group):
+    chk.check_partial_numbers(lines, stats, season_dir, group, *EPISODE)
+    chk.check_number_gaps(lines, stats, season_dir, group, *EPISODE)
+    chk.check_duplicate_titles(lines, stats, season_dir, group)
+    chk.check_duplicates(
+        lines, stats, season_dir, group, *EPISODE, leading_int,
+    )
+    for key in ("show", "season"):
+        chk.check_inconsistent(lines, stats, season_dir, group, key)
+
+
+def check_movie_group(lines, stats, series_dir, group):
+    chk.check_duplicate_titles(lines, stats, series_dir, group)
+    chk.check_inconsistent(lines, stats, series_dir, group, "series")
+
+
+def check_group(lines, stats, group_dir, group):
+    if kind_of(group[0][0]) == "episode":
+        check_episode_group(lines, stats, group_dir, group)
+    else:
+        check_movie_group(lines, stats, group_dir, group)
+
+
+def check_filename_season(lines, stats, file, fields):
+    """Warn if an "S01E03"-style filename names another season."""
+    pair = season_episode_from_name(Path(file).stem)
+    season = fields.get("season")
+    if not pair or season is None or pair[0] == season:
+        return
+    message = (
+        f"{file}: filename says season {pair[0]}, but season is "
+        f"{season}."
+    )
+    chk.warn_field(lines, stats, message, file, "season")
+
+
+def check_year_plausible(lines, stats, file, fields):
+    year = fields.get("year")
+    if not isinstance(year, int) or 1870 <= year <= date.today().year + 2:
+        return
+    message = f"{file}: year {year} looks wrong."
+    chk.warn_field(lines, stats, message, file, "year")
+
+
+def check_episode(lines, stats, file, fields, group):
+    chk.check_null_and_blank_fields(lines, stats, file, fields)
+    for key in ("season", "episode"):
+        chk.check_is_int(lines, stats, file, fields, key, key)
+    chk.check_in_range(lines, stats, file, fields, group, *EPISODE)
+    chk.check_nonzero(lines, stats, file, fields, *EPISODE)
+    chk.check_filename_match(
+        lines, stats, file, fields, *EPISODE,
+        episode_from_name, strip_episode_number,
+    )
+    chk.check_title_number_prefix(
+        lines, stats, file, fields, "episode", episode_from_name,
+    )
+    chk.check_title_matches_field(lines, stats, file, fields, "show")
+    check_filename_season(lines, stats, file, fields)
+
+
+def check_movie(lines, stats, file, fields, group):
+    chk.check_null_and_blank_fields(lines, stats, file, fields)
+    chk.check_is_int(lines, stats, file, fields, *YEAR)
+    check_year_plausible(lines, stats, file, fields)
+    chk.check_filename_match(
+        lines, stats, file, fields, *YEAR, year_from_name, strip_year,
+    )
+
+
+def check_entry(lines, stats, file, fields, group):
+    check = check_episode if kind_of(file) == "episode" else check_movie
+    check(lines, stats, file, fields, group)
+
+
+def run_check(args):
+    """Flag likely mistakes in the queue, asking how to resolve each.
+    No network, no root needed."""
+    chk.run_check(args.queue, check_group, check_entry)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+ROOT_HELP = "Root folder of show/season/episode and series/movie files."
+
+
+def add_opensubtitles_args(subparser, login=False):
+    env = os.environ.get
+    subparser.add_argument(
+        "--opensubtitles-api-key", default=env("TMF_OPENSUBTITLES_API_KEY"),
+        help="OpenSubtitles API key (default: $TMF_OPENSUBTITLES_API_KEY)",
+    )
+    if not login:
+        return
+    subparser.add_argument(
+        "--opensubtitles-username",
+        default=env("TMF_OPENSUBTITLES_USERNAME"),
+        help="Optional login (default: $TMF_OPENSUBTITLES_USERNAME)",
+    )
+    subparser.add_argument(
+        "--opensubtitles-password",
+        default=env("TMF_OPENSUBTITLES_PASSWORD"),
+        help="Login password (default: $TMF_OPENSUBTITLES_PASSWORD)",
+    )
+
+
+def add_subtitle_args(scan_p):
+    scan_p.add_argument(
+        "--no-subs", action="store_true",
+        help="Don't download subtitles.",
+    )
+    scan_p.add_argument(
+        "--sub-lang", default="en", type=subtitle_language,
+        help="Subtitle language as OpenSubtitles codes it, e.g. fr or "
+             "pt-BR (default: %(default)s)",
+    )
+    add_dir_arg(scan_p, "--subs-dir", DEFAULT_SUBTITLES_DIR,
+                "Where to save downloaded subtitles")
+    add_opensubtitles_args(scan_p, login=True)
+
+
+def add_scan_args(subparsers):
+    scan_p = subparsers.add_parser(
+        "scan", help="Look up metadata; queue changes and subtitles.",
+    )
+    add_root_arg(scan_p, ROOT_HELP)
+    add_queue_arg(scan_p, "Where to write queued changes")
+    scan_p.add_argument(
+        "--tmdb-api-key", default=os.environ.get("TMF_TMDB_API_KEY"),
+        help="TMDB API key for movie lookups (default: $TMF_TMDB_API_KEY)",
+    )
+    scan_p.add_argument(
+        "--no-tvmaze", action="store_true",
+        help="Don't look episodes up on TVmaze.",
+    )
+    add_subtitle_args(scan_p)
+
+
+def add_fingerprint_args(subparsers):
+    fingerprint_p = subparsers.add_parser(
+        "fingerprint",
+        help="Check queued entries against OpenSubtitles' file hashes.",
+    )
+    add_root_arg(fingerprint_p, SCANNED_ROOT_HELP)
+    add_queue_arg(fingerprint_p, "Queue file to check")
+    add_opensubtitles_args(fingerprint_p)
+
+
+def add_apply_args(subparsers):
+    apply_p = subparsers.add_parser(
+        "apply", help="Write queued changes and subtitles to disk.",
+    )
+    add_root_arg(apply_p, SCANNED_ROOT_HELP)
+    add_queue_arg(apply_p, "Queue file to apply")
+    add_dir_arg(apply_p, "--subs-dir", DEFAULT_SUBTITLES_DIR,
+                "Where scan saved subtitles")
+    add_dry_run_arg(apply_p)
+
+
+def add_convert_args(subparsers):
+    add_convert_parser(
+        subparsers, "Remux files into another container.", ROOT_HELP,
+        ("avi", "mkv"),
+    )
+
+
+def add_rename_args(subparsers):
+    rename_p = subparsers.add_parser(
+        "rename", help="Rename files from their tags.",
+    )
+    add_root_arg(rename_p, ROOT_HELP)
+    rename_p.add_argument(
+        "--episodes",
+        help="Episode template, e.g. 'S%%season E%%episode - %%title'. "
+             "Placeholders: %%show, %%season, %%episode, %%title, %%ext.",
+    )
+    rename_p.add_argument(
+        "--movies",
+        help="Movie template, e.g. '%%title (%%year)'. Placeholders: "
+             "%%series, %%title, %%year, %%ext.",
+    )
+    add_dry_run_arg(rename_p)
+
+
+def build_arg_parser():
+    return build_parser("tv_metafix", __doc__, (
+        add_scan_args, add_check_parser, add_fingerprint_args,
+        add_apply_args, add_convert_args,
+        add_rename_args,
+    ))
+
+
+STEP_HANDLERS = {
+    "scan": run_scan,
+    "check": run_check,
+    "fingerprint": run_fingerprint,
+    "apply": run_apply,
+    "convert": run_convert,
+    "rename": run_rename,
+}
+
+
+def main():
+    run_step(build_arg_parser(), STEP_HANDLERS)
+
+
+if __name__ == "__main__":
+    main()
