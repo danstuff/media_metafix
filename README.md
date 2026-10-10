@@ -4,7 +4,7 @@ A pair of scripts that check and fix media library metadata:
 
 - **`music_metafix`**: music as `root/artist/album/song.ext`.
 - **`tv_metafix`**: shows as `root/show/season/episode.ext` and/or
-  movies as `root/series/title.ext`. One root can hold both.
+  movies as `root/series/title.ext`.
 
 Folder names are trusted (artist/album, show/season, series); the rest
 comes from online lookups.
