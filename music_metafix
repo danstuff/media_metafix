@@ -63,7 +63,7 @@ from common.files import (
 from common.http import cached
 from common.queue import (
     apply_queue, build_queue_fields, load_queue, print_scan_summary,
-    scan_to_queue, verify_queue_root,
+    render_yaml_scalar, scan_to_queue, verify_queue_root,
 )
 from common.steps import convert_extensions, process_each
 from common.text import (
@@ -235,6 +235,63 @@ def iter_music_files(root):
 
 
 # ---------------------------------------------------------------------------
+# Multi-disc albums: sibling "Album (Disc 1)", "Album (Disc 2)", ...
+# folders are one album, "Album". Filenames number tracks per disc; the
+# queue numbers them across the whole album.
+# ---------------------------------------------------------------------------
+
+DISC_FOLDER_RE = re.compile(r"^(.+?)\s*\(disc\s*(\d+)\)\s*$", re.IGNORECASE)
+
+
+def parse_disc_folder(name):
+    """("Album", 2) for "Album (Disc 2)", else None."""
+    match = DISC_FOLDER_RE.match(name)
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def sibling_discs(album_dir):
+    """{disc number: dir} for album_dir and its sibling discs, or {}
+    unless album_dir is one disc of several."""
+    parsed = parse_disc_folder(album_dir.name)
+    if parsed is None:
+        return {}
+    discs = {}
+    for sibling in iter_dirs(album_dir.parent):
+        other = parse_disc_folder(sibling.name)
+        if other and other[0].casefold() == parsed[0].casefold():
+            discs[other[1]] = sibling
+    return discs if len(discs) > 1 else {}
+
+
+def album_identity(album_dir):
+    """(album name, track offset) for album_dir. A disc of a
+    multi-disc album is named for the whole album, and its tracks come
+    after every audio file on the earlier discs."""
+    discs = sibling_discs(album_dir)
+    if not discs:
+        return album_dir.name, 0
+    album_name, disc = parse_disc_folder(album_dir.name)
+    offset = sum(
+        sum(1 for f in iter_files(disc_dir) if is_audio(f))
+        for number, disc_dir in discs.items() if number < disc
+    )
+    return album_name, offset
+
+
+def album_group_key(file):
+    """The album a queued `file` belongs to, merging disc folders."""
+    album_dir = Path(file).parent
+    parsed = parse_disc_folder(album_dir.name)
+    return album_dir.parent / parsed[0] if parsed else album_dir
+
+
+def is_later_disc(file):
+    """True for files in "(Disc N)" folders with N > 1."""
+    parsed = parse_disc_folder(Path(file).parent.name)
+    return bool(parsed) and parsed[1] > 1
+
+
+# ---------------------------------------------------------------------------
 # MusicBrainz
 # ---------------------------------------------------------------------------
 
@@ -263,7 +320,10 @@ def credited_artists(recording):
 
 
 def recognize_via_musicbrainz_text(artist_name, album_name):
-    """{position: {"title", "artists"}} for an album, or None."""
+    """{position: {"title", "artists"}} for an album, or None.
+    Positions restart on each medium (disc, vinyl side), so each is
+    offset by the earlier media's track counts: with 5 tracks on side
+    A, B2 is position 7."""
     release_id = find_release_id(artist_name, album_name)
     if not release_id:
         return None
@@ -271,13 +331,16 @@ def recognize_via_musicbrainz_text(artist_name, album_name):
         release_id, includes=["recordings", "artist-credits"],
     )
     track_map = {}
+    offset = 0
     for medium in full["release"].get("medium-list", []):
-        for track in medium.get("track-list", []):
+        tracks = medium.get("track-list", [])
+        for track in tracks:
             recording = track["recording"]
-            track_map[int(track["position"])] = {
+            track_map[offset + int(track["position"])] = {
                 "title": recording["title"],
                 "artists": credited_artists(recording),
             }
+        offset += len(tracks)
     return track_map or None
 
 
@@ -399,10 +462,11 @@ def queue_album_art(root, art_dir, filename, contact):
         return
     root = Path(root)
     spec = load_mmfignore(root)
-    for artist_name, album_name, album_dir in iter_albums(root, spec):
+    for artist_name, folder_name, album_dir in iter_albums(root, spec):
         if (album_dir / filename).exists():
             continue
-        dest_dir = Path(art_dir) / artist_name / album_name
+        album_name, _offset = album_identity(album_dir)
+        dest_dir = Path(art_dir) / artist_name / folder_name
         download_album_art(artist_name, album_name, dest_dir, filename)
 
 
@@ -459,10 +523,17 @@ def coerce_queue_field(key, value):
 
 
 def compute_scan_change(root, path, args, cache):
-    """None, or (file, fields, previous) for `path`'s queue entry."""
+    """None, or (file, fields, previous) for `path`'s queue entry.
+    Files MusicBrainz can't match are queued with their existing tags
+    (missing ones null) for check to flag."""
     current = read_track_tags(path)
-    artist_name, album_name = path.parent.parent.name, path.parent.name
+    artist_name = path.parent.parent.name
+    if path.parent not in cache:
+        cache[path.parent] = album_identity(path.parent)
+    album_name, track_offset = cache[path.parent]
     filename_track = track_number_from_filename(path.stem)
+    if filename_track is not None:
+        filename_track += track_offset
     filename_title = strip_filename_track_prefix(path.stem).strip()
 
     updates = {}
@@ -470,11 +541,13 @@ def compute_scan_change(root, path, args, cache):
     track_map = album_tracks(artist_name, album_name, args, cache) or {}
     pos = locate_track(track_map, filename_track, filename_title)
     if pos is None:
-        warn(f"No MusicBrainz match found for {path}")
+        warn(f"No MusicBrainz match found for {path} -- queuing its "
+             f"existing tags.")
     else:
         apply_track_match(updates, current, pos, track_map[pos])
     queue_filename_track(updates, current, filename_track)
-    if not updates:
+    # Unmatched files are always queued, so check flags their nulls.
+    if not updates and pos is not None:
         return None
     fields, previous = build_queue_fields(
         current, updates, QUEUE_FIELDS, coerce_queue_field,
@@ -621,9 +694,11 @@ def lookup_fingerprint(path, api_key, title):
         return None
 
 
-def fingerprint_one_file(root, api_key, file, fields):
+def fingerprint_one_file(root, api_key, lines, file, fields):
     """Counter keys for one entry: ("skipped",), ("checked",) or
-    ("checked", "mismatch")."""
+    ("checked", "mismatch"[, "corrected"]). A mismatched title is
+    replaced in `lines` with the closest fingerprint title, minus
+    variations like "(Live)"."""
     title = fields.get("title")
     path = root / file
     if not title:
@@ -638,10 +713,17 @@ def fingerprint_one_file(root, api_key, file, fields):
     if ok is None:
         warn(f"{file}: no AcoustID fingerprint match found for this file.")
     elif not ok:
-        warn(
+        message = (
             f"{file}: queued title {title!r} doesn't match fingerprint "
             f"(closest: {best_title!r}, similarity {best_score:.2f})"
         )
+        new_title = strip_title_variations(best_title)
+        if chk.replace_field_value(
+            lines, file, "title", render_yaml_scalar(new_title),
+        ):
+            warn(f"{message} -- corrected to {new_title!r}.")
+            return ("checked", "mismatch", "corrected")
+        warn(f"{message} -- couldn't find its title line to correct.")
         return ("checked", "mismatch")
     return ("checked",)
 
@@ -659,22 +741,29 @@ def fingerprinting_available(args):
 
 
 def run_fingerprint(args):
-    """Warn about queued titles that don't match what AcoustID hears."""
+    """Correct queued titles that don't match what AcoustID hears,
+    saving the queue after each correction."""
     if not fingerprinting_available(args):
         return
     root = Path(args.root)
+    with open(args.queue, encoding="utf-8") as f:
+        lines = f.read().splitlines()
     counts = Counter()
     try:
         for file, fields in load_queue(args.queue).items():
-            counts.update(fingerprint_one_file(
-                root, args.acoustid_api_key, file, fields,
-            ))
+            keys = fingerprint_one_file(
+                root, args.acoustid_api_key, lines, file, fields,
+            )
+            counts.update(keys)
+            if "corrected" in keys:
+                chk.write_queue_lines(args.queue, lines)
     except AbortFingerprinting as exc:
         warn(f"{exc} Aborting fingerprint check.")
         return
     print(
         f"\n{counts['checked']} track(s) fingerprinted, "
-        f"{counts['mismatch']} mismatch(es), {counts['skipped']} skipped."
+        f"{counts['mismatch']} mismatch(es), {counts['corrected']} "
+        f"corrected, {counts['skipped']} skipped."
     )
 
 
@@ -860,8 +949,13 @@ def check_track(lines, stats, file, fields, group):
     chk.check_is_int(lines, stats, file, fields, *TRACK)
     chk.check_in_range(lines, stats, file, fields, group, *TRACK)
     chk.check_nonzero(lines, stats, file, fields, *TRACK)
+    # Later discs' filenames number tracks per disc, so only their
+    # titles can be compared.
+    filename_fields = (
+        {**fields, "tracknumber": None} if is_later_disc(file) else fields
+    )
     chk.check_filename_match(
-        lines, stats, file, fields, *TRACK,
+        lines, stats, file, filename_fields, *TRACK,
         track_number_from_filename, strip_filename_track_prefix,
     )
     chk.check_title_number_prefix(
@@ -875,7 +969,7 @@ def check_track(lines, stats, file, fields, group):
 def run_check_step(args):
     """Flag likely mistakes in the queue, asking how to resolve each.
     No network, no root needed."""
-    chk.run_check(args.queue, check_album, check_track)
+    chk.run_check(args.queue, check_album, check_track, album_group_key)
 
 
 # ---------------------------------------------------------------------------
@@ -922,10 +1016,11 @@ def add_scan_args(subparsers):
 
 def add_fingerprint_args(subparsers):
     fingerprint_p = subparsers.add_parser(
-        "fingerprint", help="Check queued titles against AcoustID.",
+        "fingerprint",
+        help="Check queued titles against AcoustID, correcting mismatches.",
     )
     add_root_arg(fingerprint_p, SCANNED_ROOT_HELP)
-    add_queue_arg(fingerprint_p, "Queue file to check")
+    add_queue_arg(fingerprint_p, "Queue file to check and correct")
     fingerprint_p.add_argument(
         "--acoustid-api-key", default=os.environ.get("MMF_ACOUSTID_API_KEY"),
         help="AcoustID API key (default: $MMF_ACOUSTID_API_KEY)",

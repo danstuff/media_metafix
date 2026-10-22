@@ -103,6 +103,24 @@ def test_recognize_via_musicbrainz_text(mmf, fake_mb):
     assert fake_mb.searches == [("Artist A", "Album")]
 
 
+def test_recognize_numbers_later_media_after_earlier_ones(mmf, fake_mb,
+                                                          monkeypatch):
+    def side(*titles):
+        return {"track-list": [
+            {"position": str(i), "recording": {"title": title}}
+            for i, title in enumerate(titles, 1)
+        ]}
+    release = {"release": {"medium-list": [
+        side("A1", "A2", "A3"), side("B1", "B2"),
+    ]}}
+    monkeypatch.setattr(fake_mb, "get_release_by_id",
+                        lambda _id, includes: release)
+    track_map = mmf.recognize_via_musicbrainz_text("Artist A", "Album")
+    assert {pos: data["title"] for pos, data in track_map.items()} == {
+        1: "A1", 2: "A2", 3: "A3", 4: "B1", 5: "B2",
+    }
+
+
 def test_recognize_no_release(mmf, fake_mb):
     fake_mb.releases = []
     assert mmf.recognize_via_musicbrainz_text("X", "Y") is None
@@ -162,6 +180,75 @@ def test_scan_queues_musicbrainz_changes_and_art(mmf, fake_mb, monkeypatch,
         "tracknumber": 2,
     }}
     assert (art_dir / "Artist A" / "Album" / "art.jpg").exists()
+
+
+@needs_ffmpeg
+def test_scan_queues_existing_tags_when_unmatched(mmf, tmp_path, answer,
+                                                  capsys):
+    root = tmp_path / "root"
+    make_audio(root / "Artist A" / "Album" / "03 - song.mp3",
+               "-metadata", "title=Song", "-metadata", "artist=Artist A",
+               "-metadata", "album=Album", "-metadata", "track=3")
+    queue = tmp_path / "q.yml"
+    mmf.run_scan(Namespace(
+        root=str(root), queue=str(queue), no_art=True,
+        musicbrainz_contact="me@example.com", no_musicbrainz=True,
+    ))
+    assert mmf.load_queue(queue) == {"Artist A/Album/03 - song.mp3": {
+        "album": "Album", "artist": "Artist A", "artists": None,
+        "title": "Song", "tracknumber": 3,
+    }}
+    assert "queuing its existing tags" in capsys.readouterr().err
+
+    answer("2")
+    mmf.run_check_step(Namespace(queue=queue))
+    assert "artists couldn't be determined (null)" in capsys.readouterr().out
+
+
+@needs_ffmpeg
+def test_scan_numbers_disc_folders_across_the_album(mmf, fake_mb,
+                                                    tmp_path, answer,
+                                                    capsys):
+    root = tmp_path / "root"
+    make_audio(root / "Artist A" / "Album (Disc 1)" / "01 - first song.mp3",
+               "-metadata", "title=First Song", "-metadata", "track=1")
+    make_audio(root / "Artist A" / "Album (Disc 2)" / "01 - second song.mp3",
+               "-metadata", "title=Second Song", "-metadata", "track=1")
+    queue = tmp_path / "q.yml"
+    mmf.run_scan(Namespace(
+        root=str(root), queue=str(queue), no_art=True,
+        musicbrainz_contact="me@example.com", no_musicbrainz=False,
+    ))
+    entries = mmf.load_queue(queue)
+    assert fake_mb.searches == [("Artist A", "Album")]
+    assert entries["Artist A/Album (Disc 1)/01 - first song.mp3"][
+        "tracknumber"] == 1
+    assert entries["Artist A/Album (Disc 2)/01 - second song.mp3"] == {
+        "album": "Album", "artist": "Artist A",
+        "artists": ["Artist A", "Guest"], "title": "Second Song",
+        "tracknumber": 2,
+    }
+    capsys.readouterr()
+
+    answer("2")
+    mmf.run_check_step(Namespace(queue=queue))
+    out = capsys.readouterr().out
+    assert "filename doesn't match" not in out
+    assert "No inconsistencies found" in out
+
+
+def test_album_identity(mmf, tmp_path):
+    artist = tmp_path / "Artist"
+    for disc, count in (("Album (Disc 1)", 5), ("album (disc 2)", 1)):
+        (artist / disc).mkdir(parents=True)
+        for i in range(count):
+            (artist / disc / f"{i + 1:02} - x.mp3").touch()
+    (artist / "Album (Disc 1)" / "cover.jpg").touch()
+    (artist / "Solo (Disc 1)").mkdir()
+    assert mmf.album_identity(artist / "Album (Disc 1)") == ("Album", 0)
+    assert mmf.album_identity(artist / "album (disc 2)") == ("album", 5)
+    assert mmf.album_identity(artist / "Solo (Disc 1)") == (
+        "Solo (Disc 1)", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +330,27 @@ def test_run_fingerprint_reports_mismatch(mmf, monkeypatch, tmp_path,
     assert "A/B/b.mp3: queued title 'Something Else' doesn't match" in err
     assert "A/B/a.mp3" not in err
     assert "2 track(s) fingerprinted, 1 mismatch(es)" in out
+
+
+def test_run_fingerprint_corrects_title_keeping_was(mmf, monkeypatch,
+                                                   tmp_path, capsys):
+    monkeypatch.setattr(mmf, "acoustid", FakeAcoustid(acoustid_results(
+        (0.9, "Pilot (Live) - Remastered 2011"),
+    )))
+    fingerprint(mmf, tmp_path, (
+        "A/B/a.mp3:\n"
+        "  title: Something Else  # was: Old Name\n"
+        "  tracknumber: 1\n"
+        "A/B/b.mp3:\n"
+        "  title: 'Another # Thing'\n"
+    ))
+    out, err = capsys.readouterr()
+    queue_text = (tmp_path / "q.yml").read_text(encoding="utf-8")
+    assert "  title: Pilot  # was: Old Name\n" in queue_text
+    assert "  tracknumber: 1\n" in queue_text
+    assert "A/B/b.mp3:\n  title: Pilot\n" in queue_text
+    assert "corrected to 'Pilot'" in err
+    assert "2 mismatch(es), 2 corrected" in out
 
 
 def test_run_fingerprint_aborts_without_fpcalc(mmf, monkeypatch, tmp_path,

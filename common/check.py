@@ -64,6 +64,31 @@ def find_field_line(lines, file, key):
     return None
 
 
+def split_trailing_comment(line):
+    """(field part, trailing comment) of a queue field line, e.g.
+    ("  title: Foo", "  # was: Bar"). A "#" inside a quoted value
+    isn't a comment."""
+    for match in re.finditer(r"\s+#", line):
+        try:
+            parsed = yaml.safe_load(line[:match.start()])
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, dict):
+            return line[:match.start()], line[match.start():]
+    return line, ""
+
+
+def replace_field_value(lines, file, key, rendered_value):
+    """Set `file`'s `key` line to `rendered_value`, keeping any
+    trailing comment ("# was: ...", "# OK"). False if not found."""
+    index = find_field_line(lines, file, key)
+    if index is None:
+        return False
+    _field, comment = split_trailing_comment(lines[index])
+    lines[index] = f"  {key}: {rendered_value}{comment}"
+    return True
+
+
 def line_has_ok_comment(lines, index):
     if index is None or index >= len(lines):
         return False
@@ -318,11 +343,15 @@ def check_title_matches_field(lines, stats, file, fields, other_key):
 # Driver
 # ---------------------------------------------------------------------------
 
-def group_by_parent(entries):
-    """{parent dir: [(file, fields), ...]} for a loaded queue."""
+def parent_dir(file):
+    return Path(file).parent
+
+
+def group_entries(entries, group_key=parent_dir):
+    """{group_key(file): [(file, fields), ...]} for a loaded queue."""
     groups = {}
     for file, fields in entries.items():
-        groups.setdefault(Path(file).parent, []).append((file, fields))
+        groups.setdefault(group_key(file), []).append((file, fields))
     return groups
 
 
@@ -331,10 +360,12 @@ def write_queue_lines(queue_file, lines):
         f.write("\n".join(lines) + "\n")
 
 
-def run_checks(lines, stats, entries, check_group, check_entry):
-    """`check_group(lines, stats, dir, group)` per directory, then
-    `check_entry(lines, stats, file, fields, group)` per entry."""
-    for group_dir, group in group_by_parent(entries).items():
+def run_checks(lines, stats, entries, check_group, check_entry,
+               group_key=parent_dir):
+    """`check_group(lines, stats, dir, group)` per group (by default
+    each directory), then `check_entry(lines, stats, file, fields,
+    group)` per entry."""
+    for group_dir, group in group_entries(entries, group_key).items():
         check_group(lines, stats, group_dir, group)
         for file, fields in list(group):
             check_entry(lines, stats, file, fields, group)
@@ -356,8 +387,9 @@ def print_check_summary(queue_file, stats):
         print(f"\nNo inconsistencies found in {queue_file}")
 
 
-def run_check(queue_file, check_group, check_entry):
-    """Check `queue_file`, re-running after each manual edit."""
+def run_check(queue_file, check_group, check_entry, group_key=parent_dir):
+    """Check `queue_file`, re-running after each manual edit.
+    `group_key(file)` names the group each entry is checked with."""
     while True:
         with open(queue_file, encoding="utf-8") as f:
             raw_text = f.read()
@@ -365,7 +397,8 @@ def run_check(queue_file, check_group, check_entry):
         entries = yaml.safe_load(raw_text) or {}
         stats = CheckStats()
         try:
-            run_checks(lines, stats, entries, check_group, check_entry)
+            run_checks(lines, stats, entries, check_group, check_entry,
+                       group_key)
         except RestartCheck as restart:
             if stats.changed:
                 write_queue_lines(queue_file, lines)
