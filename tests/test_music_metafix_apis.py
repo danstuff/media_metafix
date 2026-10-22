@@ -30,15 +30,19 @@ class FakeMusicBrainz:
     """Stands in for the musicbrainzngs module."""
 
     def __init__(self, releases=({"id": "mbid-1"},)):
+        # Releases lacking a title or credit echo the search's.
         self.releases = list(releases)
         self.searches = []
 
     def set_useragent(self, *_args):
         pass
 
-    def search_releases(self, artist, release, limit):
+    def search_releases(self, artist, release, limit, strict=False):
         self.searches.append((artist, release))
-        return {"release-list": self.releases}
+        return {"release-list": [
+            {"title": release, "artist-credit-phrase": artist, **found}
+            for found in self.releases
+        ]}
 
     def get_release_by_id(self, release_id, includes):
         assert release_id == "mbid-1"
@@ -124,6 +128,19 @@ def test_recognize_numbers_later_media_after_earlier_ones(mmf, fake_mb,
 def test_recognize_no_release(mmf, fake_mb):
     fake_mb.releases = []
     assert mmf.recognize_via_musicbrainz_text("X", "Y") is None
+
+
+def test_find_release_skips_results_not_matching_folders(mmf, fake_mb):
+    fake_mb.releases = [
+        {"id": "jam-jam", "title": "Jam Jam",
+         "artist-credit-phrase": "Adama Dicko"},
+        {"id": "pearl-jam", "title": "Pearl Jam",
+         "artist-credit-phrase": "Pearl Jam"},
+    ]
+    assert mmf.find_release_id("Pearl Jam", "Pearl Jam") == "pearl-jam"
+    fake_mb.releases = fake_mb.releases[:1]
+    assert mmf.find_release_id("Pearl Jam", "Pearl Jam") is None
+    assert len(fake_mb.searches) == 3  # strict, then loose, when unmatched
 
 
 @pytest.mark.parametrize("filename_track, filename_title, expected", [

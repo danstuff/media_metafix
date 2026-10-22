@@ -67,7 +67,7 @@ from common.queue import (
 )
 from common.steps import convert_extensions, process_each
 from common.text import (
-    best_fuzzy_match, fuzzy_ratio, leading_int,
+    FUZZY_MATCH_THRESHOLD, best_fuzzy_match, fuzzy_ratio, leading_int,
     render_filename as render_template, should_replace,
 )
 from common.ui import (
@@ -303,12 +303,34 @@ def configure_musicbrainz(contact):
     return True
 
 
-def find_release_id(artist_name, album_name):
-    results = musicbrainzngs.search_releases(
-        artist=artist_name, release=album_name, limit=1,
+RELEASE_SEARCH_LIMIT = 10
+
+
+def release_matches(release, artist_name, album_name):
+    """True if a search result's title and credit roughly match the
+    folder names."""
+    return (
+        fuzzy_ratio(release.get("title"), album_name)
+        >= FUZZY_MATCH_THRESHOLD
+        and fuzzy_ratio(release.get("artist-credit-phrase"), artist_name)
+        >= FUZZY_MATCH_THRESHOLD
     )
-    releases = results.get("release-list") or []
-    return releases[0]["id"] if releases else None
+
+
+def find_release_id(artist_name, album_name):
+    """The best release matching the folder names, or None. A strict
+    (exact phrase) search goes first: loose searches OR every word, so
+    "Pearl Jam" by Pearl Jam ranks "Jam Jam" by anyone first. Either
+    way, results must roughly match the folder names."""
+    for strict in (True, False):
+        results = musicbrainzngs.search_releases(
+            artist=artist_name, release=album_name,
+            limit=RELEASE_SEARCH_LIMIT, strict=strict,
+        )
+        for release in results.get("release-list") or []:
+            if release_matches(release, artist_name, album_name):
+                return release["id"]
+    return None
 
 
 def credited_artists(recording):
