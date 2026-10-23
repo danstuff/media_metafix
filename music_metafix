@@ -272,10 +272,20 @@ def album_identity(album_dir):
         return album_dir.name, 0
     album_name, disc = parse_disc_folder(album_dir.name)
     offset = sum(
-        sum(1 for f in iter_files(disc_dir) if is_audio(f))
+        count_audio_files(disc_dir)
         for number, disc_dir in discs.items() if number < disc
     )
     return album_name, offset
+
+
+def count_audio_files(album_dir):
+    return sum(1 for f in iter_files(album_dir) if is_audio(f))
+
+
+def album_track_count(album_dir):
+    """Audio files in album_dir's whole album, every disc included."""
+    discs = sibling_discs(album_dir) or {1: album_dir}
+    return sum(count_audio_files(d) for d in discs.values())
 
 
 def album_group_key(file):
@@ -303,7 +313,7 @@ def configure_musicbrainz(contact):
     return True
 
 
-RELEASE_SEARCH_LIMIT = 10
+RELEASE_SEARCH_LIMIT = 25
 
 
 def release_matches(release, artist_name, album_name):
@@ -317,19 +327,46 @@ def release_matches(release, artist_name, album_name):
     )
 
 
-def find_release_id(artist_name, album_name):
+def release_track_count(release):
+    return sum(
+        int(medium.get("track-count") or 0)
+        for medium in release.get("medium-list") or []
+    )
+
+
+def release_rank(release, track_count):
+    """Sort key putting the likeliest release for a folder of
+    `track_count` files (if known) first: closest track count, then
+    albums over singles, then official over bootleg or promo."""
+    group = release.get("release-group") or {}
+    return (
+        abs(release_track_count(release) - track_count)
+        if track_count else 0,
+        group.get("primary-type") != "Album",
+        release.get("status") != "Official",
+    )
+
+
+def find_release_id(artist_name, album_name, track_count=None):
     """The best release matching the folder names, or None. A strict
     (exact phrase) search goes first: loose searches OR every word, so
     "Pearl Jam" by Pearl Jam ranks "Jam Jam" by anyone first. Either
-    way, results must roughly match the folder names."""
+    way, results must roughly match the folder names. Exact matches
+    often tie (an album and its single share a title), so they're
+    ranked by release_rank."""
     for strict in (True, False):
         results = musicbrainzngs.search_releases(
             artist=artist_name, release=album_name,
             limit=RELEASE_SEARCH_LIMIT, strict=strict,
         )
-        for release in results.get("release-list") or []:
-            if release_matches(release, artist_name, album_name):
-                return release["id"]
+        candidates = [
+            release for release in results.get("release-list") or []
+            if release_matches(release, artist_name, album_name)
+        ]
+        if candidates:
+            best = min(candidates,
+                       key=lambda r: release_rank(r, track_count))
+            return best["id"]
     return None
 
 
@@ -341,12 +378,13 @@ def credited_artists(recording):
     ]
 
 
-def recognize_via_musicbrainz_text(artist_name, album_name):
+def recognize_via_musicbrainz_text(artist_name, album_name,
+                                   track_count=None):
     """{position: {"title", "artists"}} for an album, or None.
     Positions restart on each medium (disc, vinyl side), so each is
     offset by the earlier media's track counts: with 5 tracks on side
     A, B2 is position 7."""
-    release_id = find_release_id(artist_name, album_name)
+    release_id = find_release_id(artist_name, album_name, track_count)
     if not release_id:
         return None
     full = musicbrainzngs.get_release_by_id(
@@ -366,13 +404,15 @@ def recognize_via_musicbrainz_text(artist_name, album_name):
     return track_map or None
 
 
-def album_tracks(artist_name, album_name, args, cache):
+def album_tracks(artist_name, album_name, args, cache, track_count=None):
     """MusicBrainz's track map for an album (cached), or None."""
     if not musicbrainzngs or args.no_musicbrainz:
         return None
     return cached(
         cache, (artist_name, album_name),
-        lambda: recognize_via_musicbrainz_text(artist_name, album_name),
+        lambda: recognize_via_musicbrainz_text(
+            artist_name, album_name, track_count,
+        ),
         f"MusicBrainz search for {artist_name}/{album_name}",
     )
 
@@ -439,14 +479,15 @@ def save_album_art(image_bytes, dest_path):
     image.save(dest_path, image_format(dest_path.name))
 
 
-def download_album_art(artist_name, album_name, dest_dir, filename):
+def download_album_art(artist_name, album_name, dest_dir, filename,
+                       track_count=None):
     """Save an album's cover art as dest_dir/filename. Errors are
     warned about, never raised."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     art_path = dest_dir / filename
     album_key = f"{artist_name}/{album_name}"
     try:
-        release_id = find_release_id(artist_name, album_name)
+        release_id = find_release_id(artist_name, album_name, track_count)
     except Exception as exc:
         warn(f"MusicBrainz release search failed for {album_key}: {exc}")
         return
@@ -489,7 +530,8 @@ def queue_album_art(root, art_dir, filename, contact):
             continue
         album_name, _offset = album_identity(album_dir)
         dest_dir = Path(art_dir) / artist_name / folder_name
-        download_album_art(artist_name, album_name, dest_dir, filename)
+        download_album_art(artist_name, album_name, dest_dir, filename,
+                           album_track_count(album_dir))
 
 
 def apply_album_art(root, art_dir, dry_run=False):
@@ -551,8 +593,10 @@ def compute_scan_change(root, path, args, cache):
     current = read_track_tags(path)
     artist_name = path.parent.parent.name
     if path.parent not in cache:
-        cache[path.parent] = album_identity(path.parent)
-    album_name, track_offset = cache[path.parent]
+        cache[path.parent] = (
+            *album_identity(path.parent), album_track_count(path.parent),
+        )
+    album_name, track_offset, track_count = cache[path.parent]
     filename_track = track_number_from_filename(path.stem)
     if filename_track is not None:
         filename_track += track_offset
@@ -560,7 +604,9 @@ def compute_scan_change(root, path, args, cache):
 
     updates = {}
     queue_folder_names(updates, current, artist_name, album_name)
-    track_map = album_tracks(artist_name, album_name, args, cache) or {}
+    track_map = album_tracks(
+        artist_name, album_name, args, cache, track_count,
+    ) or {}
     pos = locate_track(track_map, filename_track, filename_title)
     if pos is None:
         warn(f"No MusicBrainz match found for {path} -- queuing its "

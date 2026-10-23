@@ -143,6 +143,28 @@ def test_find_release_skips_results_not_matching_folders(mmf, fake_mb):
     assert len(fake_mb.searches) == 3  # strict, then loose, when unmatched
 
 
+def release(release_id, primary_type, status, *track_counts):
+    return {
+        "id": release_id, "status": status,
+        "release-group": {"primary-type": primary_type},
+        "medium-list": [{"track-count": n} for n in track_counts],
+    }
+
+
+def test_find_release_prefers_closest_track_count(mmf, fake_mb):
+    fake_mb.releases = [
+        release("single", "Single", "Official", 2),
+        release("bootleg", "Album", "Bootleg", 15),
+        release("album", "Album", "Official", 15),
+        release("double", "Album", "Official", 9, 9),
+    ]
+    assert mmf.find_release_id("A", "B", track_count=15) == "album"
+    assert mmf.find_release_id("A", "B", track_count=17) == "double"
+    assert mmf.find_release_id("A", "B", track_count=2) == "single"
+    # Unknown count: the first official album.
+    assert mmf.find_release_id("A", "B") == "album"
+
+
 @pytest.mark.parametrize("filename_track, filename_title, expected", [
     (2, "whatever", 2),       # a filename track number wins
     (None, "second song", 2),  # else fuzzy title matching
