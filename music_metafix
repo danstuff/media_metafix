@@ -197,12 +197,14 @@ def strip_filename_track_prefix(stem):
 
 def render_filename(template, path, tags):
     """`template` filled from `tags`, e.g. "%num - %title" ->
-    "01 - Song.mp3"."""
+    "01 - Song.mp3". Periods are dropped from the title ("Mr. Jones"
+    -> "Mr Jones")."""
     track_no = normalize_track(tags.get("tracknumber"))
     artists = tags.get("artists") or []
+    title = (tags.get("title") or "").replace(".", "").strip()
     return render_template(template, path, {
         "%num": f"{track_no:02d}" if track_no is not None else "00",
-        "%title": (tags.get("title") or "").strip() or path.stem,
+        "%title": title or path.stem,
         "%artist": tags.get("artist") or "",
         # artists[0] is the main artist; the rest are featured.
         "%features": ", ".join(artists[1:]),

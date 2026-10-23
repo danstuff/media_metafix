@@ -19,6 +19,9 @@ def test_render_filename(mmf, tmp_path):
         "%num - %title (feat. %features)", tmp_path / "x.mp3", tags,
     )
     assert name == "03 - Song (feat. B, C).mp3"
+    tags["title"] = "Mr. Jones feat. St. Vincent..."
+    assert mmf.render_filename("%title", tmp_path / "x.mp3", tags) == \
+        "Mr Jones feat St Vincent.mp3"
 
 
 def test_strip_title_variations(mmf):
