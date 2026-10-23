@@ -717,12 +717,37 @@ def strip_title_variations(title):
     return text
 
 
+# AcoustID error codes caused by one file (missing parameter, invalid
+# fingerprint, invalid duration), not the key or the service.
+PER_FILE_ACOUSTID_ERRORS = {2, 3, 8}
+
+
+def track_duration(path, fingerprint_duration):
+    """`path`'s length in seconds. audioread's ffmpeg backend reports 0
+    when ffmpeg can't tell ("Duration: N/A"), which AcoustID rejects as
+    missing, so mutagen's reading is the fallback."""
+    if fingerprint_duration >= 1:
+        return fingerprint_duration
+    try:
+        handle = load_track(Path(path))
+    except mutagen.MutagenError:
+        return 0
+    info = getattr(handle[1], "info", None) if handle else None
+    return getattr(info, "length", 0) or 0
+
+
 def acoustid_recording_titles(path, api_key):
     """Titles AcoustID offers for `path` with enough confidence."""
     duration, fp = acoustid.fingerprint_file(str(path))
+    duration = track_duration(path, duration)
+    if duration < 1:
+        raise acoustid.AcoustidError("couldn't determine its duration")
     response = acoustid.lookup(api_key, fp, duration, meta=["recordings"])
     if response.get("status") != "ok":
-        message = response.get("error", {}).get("message", "unknown error")
+        error = response.get("error", {})
+        message = error.get("message", "unknown error")
+        if error.get("code") in PER_FILE_ACOUSTID_ERRORS:
+            raise acoustid.AcoustidError(message)
         raise acoustid.WebServiceError(message)
     return [
         recording["title"]

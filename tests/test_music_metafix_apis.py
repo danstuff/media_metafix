@@ -61,16 +61,19 @@ class FakeAcoustid:
     class NoBackendError(AcoustidError):
         pass
 
-    def __init__(self, response):
+    def __init__(self, response, duration=180):
         self.response = response
+        self.duration = duration
+        self.lookup_durations = []
 
     def fingerprint_file(self, path):
         if isinstance(self.response, Exception):
             raise self.response
-        return 180, "fp"
+        return self.duration, "fp"
 
     def lookup(self, api_key, fp, duration, meta):
-        assert (api_key, fp, duration) == ("key", "fp", 180)
+        assert (api_key, fp) == ("key", "fp")
+        self.lookup_durations.append(duration)
         return self.response
 
 
@@ -350,6 +353,28 @@ def test_acoustid_error_status(mmf, monkeypatch):
     fake = FakeAcoustid({"status": "error", "error": {"message": "bad"}})
     monkeypatch.setattr(mmf, "acoustid", fake)
     with pytest.raises(fake.WebServiceError, match="bad"):
+        mmf.acoustid_recording_titles("x.mp3", "key")
+
+
+def test_acoustid_per_file_error_doesnt_abort(mmf, monkeypatch):
+    fake = FakeAcoustid({"status": "error", "error": {
+        "code": 3, "message": "invalid fingerprint"}})
+    monkeypatch.setattr(mmf, "acoustid", fake)
+    with pytest.raises(fake.AcoustidError) as raised:
+        mmf.acoustid_recording_titles("x.mp3", "key")
+    assert not isinstance(raised.value, fake.WebServiceError)
+
+
+def test_acoustid_zero_duration_falls_back_to_mutagen(mmf, monkeypatch):
+    fake = FakeAcoustid(acoustid_results((0.9, "Song")), duration=0)
+    monkeypatch.setattr(mmf, "acoustid", fake)
+    audio = SimpleNamespace(info=SimpleNamespace(length=201.5))
+    monkeypatch.setattr(mmf, "load_track", lambda _path: ("easy", audio))
+    assert mmf.acoustid_recording_titles("x.mp3", "key") == ["Song"]
+    assert fake.lookup_durations == [201.5]
+
+    audio.info.length = 0
+    with pytest.raises(fake.AcoustidError, match="duration"):
         mmf.acoustid_recording_titles("x.mp3", "key")
 
 
