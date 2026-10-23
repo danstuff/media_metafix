@@ -848,15 +848,19 @@ def run_fingerprint(args):
     root = Path(args.root)
     with open(args.queue, encoding="utf-8") as f:
         lines = f.read().splitlines()
+    albums = chk.group_entries(load_queue(args.queue), album_group_key)
     counts = Counter()
     try:
-        for file, fields in load_queue(args.queue).items():
-            keys = fingerprint_one_file(
-                root, args.acoustid_api_key, lines, file, fields,
-            )
-            counts.update(keys)
-            if "corrected" in keys:
-                chk.write_queue_lines(args.queue, lines)
+        for i, (album, group) in enumerate(albums.items(), 1):
+            print(f"[{i}/{len(albums)}] Fingerprinting {album.as_posix()} "
+                  f"({len(group)} track(s))...")
+            for file, fields in group:
+                keys = fingerprint_one_file(
+                    root, args.acoustid_api_key, lines, file, fields,
+                )
+                counts.update(keys)
+                if "corrected" in keys:
+                    chk.write_queue_lines(args.queue, lines)
     except AbortFingerprinting as exc:
         warn(f"{exc} Aborting fingerprint check.")
         return

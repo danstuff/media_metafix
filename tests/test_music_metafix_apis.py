@@ -399,6 +399,7 @@ def test_run_fingerprint_reports_mismatch(mmf, monkeypatch, tmp_path,
         "A/B/b.mp3: {title: Something Else}\n"
     ))
     out, err = capsys.readouterr()
+    assert "[1/1] Fingerprinting A/B (2 track(s))...\n" in out
     assert "A/B/b.mp3: queued title 'Something Else' doesn't match" in err
     assert "A/B/a.mp3" not in err
     assert "2 track(s) fingerprinted, 1 mismatch(es)" in out
