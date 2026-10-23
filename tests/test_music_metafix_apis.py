@@ -199,6 +199,19 @@ def test_apply_track_match(mmf):
                        "artists": ["Artist A", "Guest"]}
 
 
+def test_queue_fallback_artists(mmf):
+    updates = {}
+    mmf.queue_fallback_artists(updates, {"artists": []}, "Artist A")
+    assert updates == {"artists": ["Artist A"]}
+    for current, updates in (
+        ({"artists": ["X", "Y"]}, {}),           # existing credit kept
+        ({}, {"artists": ["From MusicBrainz"]}),  # a match wins
+    ):
+        before = dict(updates)
+        mmf.queue_fallback_artists(updates, current, "Artist A")
+        assert updates == before
+
+
 @needs_ffmpeg
 def test_scan_queues_musicbrainz_changes_and_art(mmf, fake_mb, monkeypatch,
                                                  tmp_path):
@@ -222,8 +235,7 @@ def test_scan_queues_musicbrainz_changes_and_art(mmf, fake_mb, monkeypatch,
 
 
 @needs_ffmpeg
-def test_scan_queues_existing_tags_when_unmatched(mmf, tmp_path, answer,
-                                                  capsys):
+def test_scan_queues_existing_tags_when_unmatched(mmf, tmp_path, capsys):
     root = tmp_path / "root"
     make_audio(root / "Artist A" / "Album" / "03 - song.mp3",
                "-metadata", "title=Song", "-metadata", "artist=Artist A",
@@ -234,14 +246,10 @@ def test_scan_queues_existing_tags_when_unmatched(mmf, tmp_path, answer,
         musicbrainz_contact="me@example.com", no_musicbrainz=True,
     ))
     assert mmf.load_queue(queue) == {"Artist A/Album/03 - song.mp3": {
-        "album": "Album", "artist": "Artist A", "artists": None,
+        "album": "Album", "artist": "Artist A", "artists": ["Artist A"],
         "title": "Song", "tracknumber": 3,
     }}
     assert "queuing its existing tags" in capsys.readouterr().err
-
-    answer("2")
-    mmf.run_check_step(Namespace(queue=queue))
-    assert "artists couldn't be determined (null)" in capsys.readouterr().out
 
 
 @needs_ffmpeg

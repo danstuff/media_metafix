@@ -572,6 +572,12 @@ def queue_folder_names(updates, current, artist_name, album_name):
         updates["album"] = album_name
 
 
+def queue_fallback_artists(updates, current, artist_name):
+    """Without other credits, artists is just the folder's artist."""
+    if "artists" not in updates and not current.get("artists"):
+        updates["artists"] = [artist_name]
+
+
 def queue_filename_track(updates, current, filename_track):
     """Last resort: the track number from the filename."""
     if "tracknumber" not in updates and filename_track is not None \
@@ -614,6 +620,7 @@ def compute_scan_change(root, path, args, cache):
     else:
         apply_track_match(updates, current, pos, track_map[pos])
     queue_filename_track(updates, current, filename_track)
+    queue_fallback_artists(updates, current, artist_name)
     # Unmatched files are always queued, so check flags their nulls.
     if not updates and pos is not None:
         return None
@@ -1010,6 +1017,17 @@ def check_artist_matches_artists(lines, stats, file, fields):
     chk.resolve_warning(lines, stats, message, ok_lines, restart_line)
 
 
+def filename_has_disc_track(lines, file):
+    """True if a later disc's filename carries its old, disc-relative
+    track number (from the "# was:" comment), which scan renumbered
+    across the album."""
+    if not is_later_disc(file):
+        return False
+    old = leading_int(chk.previous_field_value(lines, file, "tracknumber"))
+    return old is not None and track_number_from_filename(
+        Path(file).stem) == old
+
+
 def check_track(lines, stats, file, fields, group):
     """Per-track checks. Titles aren't checked against the album:
     eponymous tracks are common."""
@@ -1017,15 +1035,11 @@ def check_track(lines, stats, file, fields, group):
     chk.check_is_int(lines, stats, file, fields, *TRACK)
     chk.check_in_range(lines, stats, file, fields, group, *TRACK)
     chk.check_nonzero(lines, stats, file, fields, *TRACK)
-    # Later discs' filenames number tracks per disc, so only their
-    # titles can be compared.
-    filename_fields = (
-        {**fields, "tracknumber": None} if is_later_disc(file) else fields
-    )
-    chk.check_filename_match(
-        lines, stats, file, filename_fields, *TRACK,
-        track_number_from_filename, strip_filename_track_prefix,
-    )
+    if not filename_has_disc_track(lines, file):
+        chk.check_filename_match(
+            lines, stats, file, fields, *TRACK,
+            track_number_from_filename, strip_filename_track_prefix,
+        )
     chk.check_title_number_prefix(
         lines, stats, file, fields, "tracknumber",
         track_number_from_filename,

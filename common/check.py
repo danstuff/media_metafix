@@ -89,6 +89,24 @@ def replace_field_value(lines, file, key, rendered_value):
     return True
 
 
+WAS_COMMENT_RE = re.compile(r"#\s*was:\s*(.+?)(?=\s+#|$)")
+
+
+def previous_field_value(lines, file, key):
+    """The value in `file`'s `key` line's "# was:" comment, or None."""
+    index = find_field_line(lines, file, key)
+    if index is None:
+        return None
+    _field, comment = split_trailing_comment(lines[index])
+    match = WAS_COMMENT_RE.search(comment)
+    if not match:
+        return None
+    try:
+        return yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return None
+
+
 def line_has_ok_comment(lines, index):
     if index is None or index >= len(lines):
         return False

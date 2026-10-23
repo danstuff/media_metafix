@@ -130,6 +130,23 @@ def test_check_track_totals(mmf, tmp_path, answer, capsys):
     assert "disagree on the total track count" in capsys.readouterr().out
 
 
+def test_check_accepts_disc_relative_filename_numbers(mmf, tmp_path,
+                                                     answer, capsys):
+    queue = write_queue(tmp_path / "q.yml", (
+        "A/B (Disc 1)/01 - one.mp3:\n  title: One\n  tracknumber: 1\n"
+        "A/B (Disc 2)/01 - x.mp3:\n  title: Two\n"
+        "  tracknumber: 2  # was: 1  # OK\n"
+        "A/B (Disc 2)/02 - y.mp3:\n  title: Three\n  tracknumber: 3\n"
+    ))
+    answer("2")
+    mmf.run_check_step(Namespace(queue=queue))
+    out = capsys.readouterr().out
+    assert "01 - x.mp3: filename doesn't match" not in out
+    # No "# was:" disc number to excuse it.
+    assert "02 - y.mp3: filename doesn't match its new track number 3" \
+        in out
+
+
 def test_dry_runs_change_nothing(mmf, tmp_path, capsys):
     root = library(tmp_path)
     song = root / "Artist A" / "Album" / "01 - one.mp3"
