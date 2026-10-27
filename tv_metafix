@@ -51,8 +51,8 @@ from common.queue import (
 )
 from common.steps import convert_extensions, process_each
 from common.text import (
-    FUZZY_SAME_ENOUGH, best_fuzzy_match, fuzzy_ratio, leading_int,
-    render_filename, should_replace,
+    FUZZY_MATCH_THRESHOLD, FUZZY_SAME_ENOUGH, best_fuzzy_match,
+    fuzzy_ratio, leading_int, render_filename, should_replace,
 )
 from common.ui import note, outcome, report, warn, warn_missing_file
 
@@ -282,19 +282,42 @@ def tvmaze_episodes(show):
     return data.get("name"), titles
 
 
-def tmdb_movie(title, year, api_key):
-    """{"title", "year"} of TMDB's best match, or None."""
-    params = {"query": title, "api_key": api_key}
+def tmdb_search(query, year, api_key):
+    params = {"query": query, "api_key": api_key}
     if year:
         params["year"] = year
-    results = fetch_json(TMDB_SEARCH_URL, params).get("results") or []
-    if not results:
-        return None
-    best = results[0]
-    return {
-        "title": best.get("title"),
-        "year": leading_int((best.get("release_date") or "")[:4]),
-    }
+    return fetch_json(TMDB_SEARCH_URL, params).get("results") or []
+
+
+def best_tmdb_result(results, targets):
+    """The result whose title or original title is closest to any of
+    `targets`, or None if nothing reaches FUZZY_MATCH_THRESHOLD."""
+    best, best_score = None, 0.0
+    for result in results:
+        score = max(
+            fuzzy_ratio(result.get(key), target)
+            for key in ("title", "original_title") for target in targets
+        )
+        if score > best_score:
+            best, best_score = result, score
+    return best if best_score >= FUZZY_MATCH_THRESHOLD else None
+
+
+def tmdb_movie(title, year, api_key, series=None):
+    """{"title", "year"} of TMDB's closest match, or None. Searches
+    "<series> <title>" first, since a title like "A New Hope" alone
+    finds other movies before "Star Wars"."""
+    targets = [title]
+    if series and fuzzy_ratio(series, title) < FUZZY_SAME_ENOUGH:
+        targets.append(f"{series} {title}")
+    for query in reversed(targets):
+        best = best_tmdb_result(tmdb_search(query, year, api_key), targets)
+        if best:
+            return {
+                "title": best.get("title"),
+                "year": leading_int((best.get("release_date") or "")[:4]),
+            }
+    return None
 
 
 def show_episodes(show, args, cache):
@@ -331,12 +354,15 @@ def match_movie(guess, args, cache):
     """TMDB's {"title", "year"} for a guessed movie, or None."""
     if not args.tmdb_api_key:
         return None
-    title, year = guess["title"], guess["year"]
-    return cached(
-        cache, ("tmdb", title, year),
-        lambda: tmdb_movie(title, year, args.tmdb_api_key),
+    series, title, year = guess["series"], guess["title"], guess["year"]
+    match = cached(
+        cache, ("tmdb", series, title, year),
+        lambda: tmdb_movie(title, year, args.tmdb_api_key, series),
         f"TMDB lookup for {title!r}",
     )
+    if match and fuzzy_ratio(match["title"], title) < FUZZY_SAME_ENOUGH:
+        warn(f"TMDB matched {match['title']!r} for {series}/{title}.")
+    return match
 
 
 # ---------------------------------------------------------------------------

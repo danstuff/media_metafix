@@ -124,6 +124,64 @@ def test_tmdb_no_results(tmf, fake_api):
     assert "year" not in api.calls[0][1]
 
 
+def test_tmdb_searches_with_series_first(tmf, fake_api):
+    def search(params, body):
+        if params["query"] == "Star Wars A New Hope":
+            return {"results": [
+                {"title": "Star Wars", "release_date": "1977-05-25"},
+            ]}
+        return {"results": [
+            {"title": "A Christmas in New Hope", "release_date": "2009-12-05"},
+            {"title": "Star Wars", "release_date": "1977-05-25"},
+        ]}
+    api = fake_api(movie=search)
+    assert tmf.tmdb_movie("A New Hope", None, "key", "Star Wars") == {
+        "title": "Star Wars", "year": 1977,
+    }
+    assert len(api.calls) == 1
+
+
+def test_tmdb_falls_back_to_title_search(tmf, fake_api):
+    def search(params, body):
+        if params["query"] == "Marvel Iron Man":
+            return {"results": []}
+        return {"results": [
+            {"title": "Iron Man", "release_date": "2008-04-30"},
+        ]}
+    api = fake_api(movie=search)
+    assert tmf.tmdb_movie("Iron Man", None, "key", "Marvel")["title"] == \
+        "Iron Man"
+    assert [c[1]["query"] for c in api.calls] == \
+        ["Marvel Iron Man", "Iron Man"]
+
+
+def test_tmdb_rejects_dissimilar_results(tmf, fake_api):
+    fake_api(movie=lambda params, body: {"results": [
+        {"title": "Something Else Entirely", "release_date": "2001-01-01"},
+    ]})
+    assert tmf.tmdb_movie("A New Hope", None, "key", "Star Wars") is None
+
+
+def test_tmdb_matches_original_title(tmf, fake_api):
+    fake_api(movie=lambda params, body: {"results": [
+        {"title": "Spirited Away", "original_title": "千と千尋の神隠し",
+         "release_date": "2001-07-20"},
+    ]})
+    assert tmf.tmdb_movie("千と千尋の神隠し", None, "key")["title"] == \
+        "Spirited Away"
+
+
+def test_match_movie_warns_on_renamed_title(tmf, fake_api, capsys):
+    fake_api(movie=lambda params, body: {"results": [
+        {"title": "Star Wars", "release_date": "1977-05-25"},
+    ]})
+    guess = {"series": "Star Wars", "title": "A New Hope", "year": None}
+    args = Namespace(tmdb_api_key="key")
+    assert tmf.match_movie(guess, args, {})["title"] == "Star Wars"
+    assert "TMDB matched 'Star Wars' for Star Wars/A New Hope." in \
+        capsys.readouterr().err
+
+
 @needs_ffmpeg
 def test_scan_uses_tmdb(tmf, fake_api, tmp_path):
     fake_api(movie=lambda params, body: {"results": [{
