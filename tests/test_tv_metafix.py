@@ -1,4 +1,5 @@
 import argparse
+import subprocess
 from argparse import Namespace
 from pathlib import Path
 
@@ -186,6 +187,29 @@ def test_embed_subtitle_and_rename(tmf, tmp_path):
     tmf.rename_file(avi, "%title (x)")
     assert (tmp_path / "Show" / "Season 1" / "S01E01 Pilot.mkv").exists()
     assert (tmp_path / "Movie" / "M (x).en.srt").exists()
+
+
+@needs_ffmpeg
+def test_write_tags_to_m4v_with_chapter_track(tmf, tmp_path):
+    chapters = tmp_path / "chapters.txt"
+    chapters.write_text(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\n"
+                        "START=0\nEND=500\ntitle=Opening\n")
+    source = make_video(tmp_path / "source.mp4")
+    path = tmp_path / "Heat" / "Heat.m4v"
+    path.parent.mkdir()
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-i", str(source),
+         "-i", str(chapters), "-map_chapters", "1", "-c", "copy", str(path)],
+        check=True,
+    )
+    tmf.write_tags(path, {"series": "Heat", "title": "Heat", "year": 1995})
+    assert tmf.read_tags(path)["title"] == "Heat"
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "chapter_tags=title",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert out.strip() == "Opening"
 
 
 @needs_ffmpeg

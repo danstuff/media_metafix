@@ -229,7 +229,10 @@ def remux(path, extra_args, new_suffix=None, extra_inputs=()):
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path)]
     for extra in extra_inputs:
         cmd += ["-i", str(extra)]
-    cmd += ["-map", "0", "-map_metadata", "0", "-c", "copy"]
+    # Data streams (e.g. the chapter track of a DVD rip) can't be copied
+    # into most containers; chapters are rewritten from -map_chapters.
+    cmd += ["-map", "0", "-map", "-0:d?", "-map_metadata", "0",
+            "-c", "copy"]
     cmd += extra_args + [str(tmp_out)]
     run_ffmpeg(cmd, tmp_out)
     return replace_with(path, tmp_out, new_suffix)
