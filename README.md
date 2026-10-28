@@ -94,3 +94,6 @@ Other steps (run any step with `-h` for its options):
   music_metafix rename /library/Music/ "%num - %title"`
   tv_metafix rename /library/TV/ --episodes "S%seasonE%episode - %title" --movies "%title (%year)"
   ```
+  Add `--season-folders` to also rename season folders from their
+  episodes' tags (`Season %season` by default, or give a template using
+  `%show` and `%season`).

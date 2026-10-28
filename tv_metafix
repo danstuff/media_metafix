@@ -79,6 +79,7 @@ TAG_KEYS = {
 ALBUM_TAG_KEYS = dict(TAG_KEYS, series="album")
 
 DEFAULT_SUBTITLES_DIR = str(Path(DEFAULT_TMP_DIR) / "subtitles")
+DEFAULT_SEASON_FOLDER = "Season %season"
 
 
 # ---------------------------------------------------------------------------
@@ -1065,10 +1066,41 @@ def rename_file(path, template, dry_run=False):
     move(path, new_path, dry_run)
 
 
+def iter_season_dirs(root):
+    """Every non-ignored show/season folder under `root`."""
+    spec = load_mmfignore(root)
+    for show in iter_kept(spec, root, iter_dirs(root)):
+        yield from iter_kept(spec, root, iter_dirs(show))
+
+
+def rename_season_dir(season_dir, template, dry_run=False):
+    """Rename `season_dir` from its episodes' show/season tags, unless
+    they're missing or disagree."""
+    tags = [read_tags(v) for v in filter(is_video, iter_files(season_dir))]
+    pairs = {(t.get("show"), t.get("season")) for t in tags}
+    if len(pairs) != 1:
+        if pairs:
+            warn(f"Episodes disagree on show/season, not renaming: "
+                 f"{season_dir}")
+        return
+    (show, season), = pairs
+    if season is None:
+        warn(f"No season tag, not renaming: {season_dir}")
+        return
+    values = {"%show": show or "", "%season": two_digits(season)}
+    # Path() has no suffix, so nothing is appended to the folder name.
+    new_name = render_filename(template, Path(), values)
+    new_path = rename_target(season_dir, new_name)
+    if new_path is not None:
+        move(season_dir, new_path, dry_run)
+
+
 def run_rename(args):
-    """Rename episodes/movies from their tags via their templates."""
-    if not (args.episodes or args.movies):
-        note("give --episodes and/or --movies -- nothing to do.")
+    """Rename episodes/movies (and optionally season folders) from
+    their tags via their templates."""
+    if not (args.episodes or args.movies or args.season_folders):
+        note("give --episodes, --movies and/or --season-folders -- "
+             "nothing to do.")
         return
     root = Path(args.root)
     for path in iter_videos(root):
@@ -1076,6 +1108,9 @@ def run_rename(args):
         template = args.episodes if kind == "episode" else args.movies
         if template:
             rename_file(path, template, args.dry_run)
+    if args.season_folders:
+        for season_dir in list(iter_season_dirs(root)):
+            rename_season_dir(season_dir, args.season_folders, args.dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -1268,6 +1303,13 @@ def add_rename_args(subparsers):
         "--movies",
         help="Movie template, e.g. '%%title (%%year)'. Placeholders: "
              "%%series, %%title, %%year, %%ext.",
+    )
+    rename_p.add_argument(
+        "--season-folders", nargs="?", const=DEFAULT_SEASON_FOLDER,
+        metavar="TEMPLATE",
+        help="Also rename season folders from their episodes' tags. "
+             "Template defaults to 'Season %%season'. Placeholders: "
+             "%%show, %%season.",
     )
     add_dry_run_arg(rename_p)
 

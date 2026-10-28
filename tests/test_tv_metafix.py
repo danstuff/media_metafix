@@ -295,7 +295,7 @@ def test_run_rename(tmf, tmp_path, capsys):
                              "title": "Two"})
     tmf.write_tags(movie, {"series": "Heat", "title": "Heat", "year": 1995})
     args = Namespace(root=str(root), episodes=None, movies=None,
-                     dry_run=False)
+                     season_folders=None, dry_run=False)
     tmf.run_rename(args)
     assert "nothing to do" in capsys.readouterr().err
     args.episodes = "%show S%seasonE%episode %title"
@@ -305,6 +305,41 @@ def test_run_rename(tmf, tmp_path, capsys):
     args.movies = "%title (%year)"
     tmf.run_rename(args)
     assert (root / "Heat" / "Heat (1995).mkv").exists()
+
+
+@needs_ffmpeg
+def test_run_rename_season_folders(tmf, tmp_path, capsys):
+    root = tmp_path / "root"
+    episode = make_video(root / "Show" / "S1" / "e.mkv")
+    tmf.write_tags(episode, {"show": "Show", "season": 1, "episode": 2,
+                             "title": "Two"})
+    mixed = root / "Show" / "Mixed"
+    for name, season in (("a.mkv", 2), ("b.mkv", 3)):
+        tmf.write_tags(make_video(mixed / name),
+                       {"show": "Show", "season": season})
+    make_video(root / "Heat" / "m.mkv")
+    args = Namespace(root=str(root), episodes="E%episode",
+                     movies=None, season_folders="Season %season",
+                     dry_run=True)
+    tmf.run_rename(args)
+    out, err = capsys.readouterr()
+    assert "Would rename: S1 -> Season 01" in out
+    assert "disagree" in err and "Mixed" in err
+    assert episode.exists()
+    args.dry_run = False
+    tmf.run_rename(args)
+    assert (root / "Show" / "Season 01" / "E02.mkv").exists()
+    assert mixed.is_dir()
+    assert (root / "Heat" / "m.mkv").exists()
+
+
+def test_season_folders_arg(tmf):
+    parser = tmf.build_arg_parser()
+    args = parser.parse_args(["rename", "r", "--season-folders"])
+    assert args.season_folders == "Season %season"
+    args = parser.parse_args(["rename", "r", "--season-folders", "S%season"])
+    assert args.season_folders == "S%season"
+    assert parser.parse_args(["rename", "r"]).season_folders is None
 
 
 @needs_ffmpeg
@@ -379,7 +414,8 @@ def test_dry_runs_change_nothing(tmf, tmp_path, capsys):
     tmf.run_convert(Namespace(root=str(root), from_ext="mkv", to_ext="mp4",
                               dry_run=True))
     tmf.run_rename(Namespace(root=str(root), episodes=None,
-                             movies="%title", dry_run=True))
+                             movies="%title", season_folders=None,
+                             dry_run=True))
 
     out = capsys.readouterr().out
     assert f"Would apply: {movie}\n  series: Heat\n" in out
