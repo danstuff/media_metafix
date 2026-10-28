@@ -10,6 +10,7 @@ from conftest import make_video, needs_ffmpeg, write_queue
 
 @pytest.mark.parametrize("name, season", [
     ("Season 2", 2), ("S03", 3), ("season_04", 4), ("7", 7),
+    ("Collection 1", 1), ("collection_02", 2), ("C3", 3),
     ("Specials", 0), ("Extras", None),
 ])
 def test_season_from_dir(tmf, name, season):
@@ -19,6 +20,7 @@ def test_season_from_dir(tmf, name, season):
 @pytest.mark.parametrize("stem, episode, title", [
     ("The Office - S01E03 - Health Care", 3, "Health Care"),
     ("show.1x12.Title", 12, "Title"),
+    ("C01E01 An Episode", 1, "An Episode"),
     ("04 - The Alliance", 4, "The Alliance"),
     ("Episode 5", 5, ""),
     ("Pilot", None, "Pilot"),
@@ -37,6 +39,11 @@ def test_movie_parsing(tmf):
 def test_guess_fields(tmf):
     assert tmf.guess_fields("Show/Season 1/S01E02 - Two.mkv") == {
         "show": "Show", "season": 1, "episode": 2, "title": "Two",
+    }
+    assert tmf.guess_fields(
+        "Mythbusters/Collection 1/C01E01 An Episode.m4v") == {
+        "show": "Mythbusters", "season": 1, "episode": 1,
+        "title": "An Episode",
     }
     assert tmf.guess_fields("Harry Potter/Goblet (2005).mp4") == {
         "series": "Harry Potter", "title": "Goblet", "year": 2005,

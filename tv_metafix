@@ -113,12 +113,13 @@ def iter_videos(root):
 # ---------------------------------------------------------------------------
 
 SEASON_DIR_RE = re.compile(
-    r"^\s*(?:season|series|s)?[\s._-]*0*(\d{1,3})\s*$", re.IGNORECASE,
+    r"^\s*(?:season|series|collection|s|c)?[\s._-]*0*(\d{1,3})\s*$",
+    re.IGNORECASE,
 )
 SPECIALS_DIR_RE = re.compile(r"^\s*specials?\s*$", re.IGNORECASE)
-# "S01E03", "s1.e3", "1x03"
+# "S01E03", "s1.e3", "1x03", "C01E03" (collections)
 SEASON_EPISODE_RE = re.compile(
-    r"\bs(\d{1,2})[\s._-]*e(\d{1,3})\b|\b(\d{1,2})x(\d{2,3})\b",
+    r"\b[sc](\d{1,2})[\s._-]*e(\d{1,3})\b|\b(\d{1,2})x(\d{2,3})\b",
     re.IGNORECASE,
 )
 # "03 - Title", "E03 Title", "Episode 3" -- not 4-digit years.
@@ -130,7 +131,8 @@ SEPARATORS = " ._-"
 
 
 def season_from_dir(name):
-    """Season number from a folder like "Season 02" or "Specials"."""
+    """Season number from a folder like "Season 02", "Collection 1"
+    or "Specials"."""
     if SPECIALS_DIR_RE.match(name):
         return 0
     match = SEASON_DIR_RE.match(name)
@@ -138,7 +140,8 @@ def season_from_dir(name):
 
 
 def season_episode_from_name(stem):
-    """(season, episode) from an "S01E03"/"1x03" token, or None."""
+    """(season, episode) from an "S01E03"/"C01E03"/"1x03" token, or
+    None."""
     match = SEASON_EPISODE_RE.search(stem)
     if not match:
         return None
