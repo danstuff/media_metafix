@@ -54,7 +54,9 @@ pip install pytest && pytest tests
 - `TMF_OPENSUBTITLES_API_KEY`: free at opensubtitles.com/consumers (for
   subtitles in `tv_metafix scan`, and `fingerprint`).
 - `TMF_OPENSUBTITLES_USERNAME` / `_PASSWORD`: optional login, raising
-  the daily subtitle download limit.
+  the daily subtitle download limit. Once it's reached, `scan` stops
+  downloading; run it again after the quota renews to fetch the rest
+  (subtitles already in `tmp/subtitles/` or the video are skipped).
 
 ## Workflow
 

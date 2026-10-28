@@ -1,5 +1,7 @@
 """TVmaze, TMDB and OpenSubtitles code, with HTTP faked out."""
 
+import io
+import json
 from argparse import Namespace
 from urllib.error import HTTPError
 
@@ -396,6 +398,44 @@ def test_apply_embeds_subtitles(tmf, fake_api, tmp_path, capsys):
     tmf.run_apply(apply_args(root, tmp_path))
     assert "Keeping existing en subtitles" in capsys.readouterr().out
     assert len(tmf.subtitle_streams(episode)) == 1
+
+
+@needs_ffmpeg
+def test_scan_stops_at_download_limit(tmf, fake_api, tmp_path, capsys):
+    root = tmp_path / "root"
+    make_video(root / "Heat" / "Heat (1995).mkv")
+    make_video(root / "Ronin" / "Ronin (1998).mkv")
+
+    def over_quota(params, body):
+        message = {"message": "Quota renewed in 6 hours ", "remaining": -1}
+        raise HTTPError("url", 406, "Not Acceptable", {},
+                        io.BytesIO(json.dumps(message).encode()))
+    api = subtitle_api(fake_api)
+    api.routes["/download"] = over_quota
+    tmf.run_scan(scan_args(root, tmp_path))
+    out, err = capsys.readouterr()
+    assert "download limit reached, stopping: Quota renewed in 6 hours" \
+        in err
+    assert len(api.requests_to("/download")) == 1
+    assert "0 subtitle file(s) downloaded" in out
+    assert not (tmp_path / "subtitles").exists()
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("queued", [
+    "Heat.en.srt", "Heat.eng.srt", "Heat.en.forced.srt", "Heat.srt",
+])
+def test_scan_skips_queued_subtitles(tmf, fake_api, tmp_path, capsys,
+                                     queued):
+    root = tmp_path / "root"
+    make_video(root / "Heat" / "Heat.mkv")
+    srt = tmp_path / "subtitles" / "Heat" / queued
+    srt.parent.mkdir(parents=True)
+    srt.write_bytes(SRT)
+    api = subtitle_api(fake_api)
+    tmf.run_scan(scan_args(root, tmp_path))
+    assert "1 already present" in capsys.readouterr().out
+    assert api.requests_to("/subtitles") == []
 
 
 @needs_ffmpeg

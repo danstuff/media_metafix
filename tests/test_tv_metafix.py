@@ -354,6 +354,7 @@ def test_dry_runs_change_nothing(tmf, tmp_path, capsys):
 @pytest.mark.parametrize("sidecar, found", [
     ("v.srt", True), ("v.en.srt", True), ("v.eng.srt", True),
     ("v.en.ass", True), ("v.vtt", True), ("v.fr.srt", False),
+    ("v.en.forced.srt", True), ("v.en-US.srt", True),
     ("other.en.srt", False),
 ])
 def test_has_subtitles_sidecars(tmf, tmp_path, sidecar, found):
@@ -364,8 +365,8 @@ def test_has_subtitles_sidecars(tmf, tmp_path, sidecar, found):
 
 @needs_ffmpeg
 @pytest.mark.parametrize("ext, language, found", [
-    (".mkv", "eng", True), (".mkv", None, True), (".mp4", None, True),
-    (".mkv", "fre", False),
+    (".mkv", "eng", True), (".mkv", "en-US", True), (".mkv", None, True),
+    (".mp4", None, True), (".mkv", "fre", False),
 ])
 def test_has_subtitles_embedded(tmf, tmp_path, ext, language, found):
     srt = tmp_path / "s.srt"

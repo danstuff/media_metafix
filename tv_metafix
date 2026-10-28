@@ -21,6 +21,7 @@ See README.md for setup and examples.
 
 import argparse
 import glob
+import json
 import os
 import re
 import struct
@@ -457,6 +458,20 @@ OPENSUBTITLES_URL = "https://api.opensubtitles.com/api/v1"
 OSHASH_CHUNK = 64 * 1024
 
 
+class DownloadLimitReached(Exception):
+    """OpenSubtitles refused a download (406): the daily quota is used
+    up, so every further download would fail too."""
+
+
+def download_limit_message(exc):
+    """OpenSubtitles' explanation of a 406, e.g. when the quota
+    renews."""
+    try:
+        return json.loads(exc.read())["message"].strip()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return "daily download limit reached"
+
+
 def oshash(path):
     """OpenSubtitles' file hash: size plus the 64-bit sums of the first
     and last 64 KiB."""
@@ -504,7 +519,13 @@ class OpenSubtitles:
         }).get("data", [])
 
     def download(self, file_id):
-        link = self.call("download", body={"file_id": file_id})["link"]
+        try:
+            link = self.call("download", body={"file_id": file_id})["link"]
+        except HTTPError as exc:
+            if exc.code == 406:
+                raise DownloadLimitReached(
+                    download_limit_message(exc)) from exc
+            raise
         return fetch(link, headers={"User-Agent": USER_AGENT})
 
 
@@ -699,15 +720,36 @@ def sidecar_language(sidecar, video):
     return sidecar.name[len(video.stem):-len(sidecar.suffix)].lstrip(".")
 
 
+def accepted_languages(lang):
+    """Lowercased tags that count as `lang` subtitles. Untagged ones
+    count, so nothing gets doubled up."""
+    return {code.lower() for code in language_codes(lang)} | UNTAGGED
+
+
+def tag_matches(tag, accepted):
+    """True if a language tag ("en", "en-US", "eng") is accepted."""
+    tag = tag.lower().replace("_", "-")
+    return tag in accepted or tag.split("-")[0] in accepted
+
+
+def has_sidecar(path, lang, accepted=None):
+    """True if a `lang` or untagged subtitle file is named after `path`
+    ("<stem>.en.srt", "<stem>.en.forced.srt", ...). `path` itself
+    needn't exist."""
+    accepted = accepted or accepted_languages(lang)
+    return any(
+        tag_matches(part, accepted)
+        for sidecar in sidecar_subtitles(path)
+        for part in sidecar_language(sidecar, path).split(".")
+    )
+
+
 def has_subtitles(path, lang):
     """True if `path` has `lang` or untagged subtitles, embedded or
-    alongside. Untagged ones count, so nothing gets doubled up."""
-    accepted = {code.lower() for code in language_codes(lang)} | UNTAGGED
-    return any(
-        sidecar_language(sidecar, path).lower() in accepted
-        for sidecar in sidecar_subtitles(path)
-    ) or any(
-        (stream.get("tags", {}).get("language") or "").lower() in accepted
+    alongside."""
+    accepted = accepted_languages(lang)
+    return has_sidecar(path, lang, accepted) or any(
+        tag_matches(stream.get("tags", {}).get("language") or "", accepted)
         for stream in subtitle_streams(path)
     )
 
@@ -784,10 +826,12 @@ def subtitle_file(subtitles_dir, root, video, lang):
 
 
 def download_subtitle(client, root, video, dest, lang):
-    """Save `video`'s best `lang` subtitles to `dest`. Returns
-    "downloaded", "present", "missing" or "error"."""
+    """Save `video`'s best `lang` subtitles to `dest`, unless some are
+    already queued beside it or in `video`. Returns "downloaded",
+    "present", "missing" or "error"; raises DownloadLimitReached."""
     try:
-        if dest.exists() or has_subtitles(video, lang):
+        if (has_sidecar(dest.with_name(video.name), lang)
+                or has_subtitles(video, lang)):
             return "present"
         file_id = find_subtitle(client, video, root, lang)
         if file_id is None:
@@ -829,14 +873,18 @@ def subtitle_setup(args):
 
 
 def queue_subtitles(root, client, lang, subtitles_dir):
-    """Download `lang` subtitles for every video lacking them."""
-    counts = Counter(
-        download_subtitle(
-            client, root, video,
-            subtitle_file(subtitles_dir, root, video, lang), lang,
-        )
-        for video in iter_videos(root)
-    )
+    """Download `lang` subtitles for every video lacking them, stopping
+    at OpenSubtitles' daily download limit."""
+    counts = Counter()
+    for video in iter_videos(root):
+        try:
+            counts[download_subtitle(
+                client, root, video,
+                subtitle_file(subtitles_dir, root, video, lang), lang,
+            )] += 1
+        except DownloadLimitReached as exc:
+            warn(f"OpenSubtitles download limit reached, stopping: {exc}")
+            break
     print(
         f"\n{counts['downloaded']} subtitle file(s) downloaded, "
         f"{counts['present']} already present, {counts['missing']} not "
