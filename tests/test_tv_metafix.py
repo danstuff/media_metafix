@@ -66,10 +66,44 @@ def test_iter_videos_mixed_root(tmf, tmp_path):
 
 def test_match_episode(tmf):
     titles = {(1, 1): "Pilot", (1, 2): "Diversity Day", (2, 1): "Pilot"}
-    by_number = {"season": 1, "episode": 2, "title": "x"}
+    by_number = {"season": 1, "episode": 2, "title": None}
     by_title = {"season": 2, "episode": None, "title": "pilot"}
     assert tmf.match_episode(by_number, titles) == (1, 2, "Diversity Day")
     assert tmf.match_episode(by_title, titles) == (2, 1, "Pilot")
+
+
+def test_match_episode_checks_number_against_title(tmf):
+    titles = {(1, 1): "George Carlin / Billy Preston, Janis Ian",
+              (1, 2): "Paul Simon / Art Garfunkel"}
+    guess = {"season": 1, "episode": 1}
+    assert tmf.match_episode(dict(guess, title="George Carlin"), titles) \
+        == (1, 1, titles[(1, 1)])
+    # A misnumbered file is found by its title...
+    assert tmf.match_episode(dict(guess, title="Paul Simon"), titles) == \
+        (1, 2, titles[(1, 2)])
+    # ...and a title matching nothing isn't overwritten.
+    assert tmf.match_episode(dict(guess, title="Unrelated"), titles) is None
+    assert tmf.match_episode(dict(guess, title=None), titles) == \
+        (1, 1, titles[(1, 1)])
+
+
+@needs_ffmpeg
+def test_scan_leaves_disagreeing_episode(tmf, tmp_path, monkeypatch, capsys):
+    root = tmp_path / "root"
+    make_video(root / "Show" / "Season 1" / "1 - George Carlin.mkv")
+    monkeypatch.setattr(tmf, "tvmaze_episodes", lambda show, local: (
+        show, {(1, 1): "Piotr Adamczyk/Daria Zawiałow"},
+    ))
+    queue = tmp_path / "changes.yml"
+    tmf.run_scan(Namespace(
+        root=str(root), queue=str(queue), tmdb_api_key=None,
+        no_tvmaze=False, no_subs=True, dry_run=False,
+    ))
+    assert "TVmaze's S01E01 is 'Piotr Adamczyk/Daria Zawiałow', not " \
+        "'George Carlin'" in capsys.readouterr().err
+    # Listed as unknown (None), so apply leaves it alone.
+    assert tmf.load_queue(queue)[
+        "Show/Season 1/1 - George Carlin.mkv"]["title"] is None
 
 
 def test_oshash(tmf, tmp_path):
@@ -149,9 +183,9 @@ def test_tag_round_trip(tmf, tmp_path, ext):
 @needs_ffmpeg
 def test_scan_and_apply(tmf, tmp_path, monkeypatch):
     root = tmp_path / "root"
-    make_video(root / "Show" / "Season 1" / "02 - Wrong.mkv")
+    make_video(root / "Show" / "Season 1" / "02 - Diversity.mkv")
     make_video(root / "Heat" / "Heat (1995).mp4", "-metadata", "title=Heat")
-    monkeypatch.setattr(tmf, "tvmaze_episodes", lambda show: (
+    monkeypatch.setattr(tmf, "tvmaze_episodes", lambda show, local: (
         show, {(1, 2): "Diversity Day"},
     ))
     queue = tmp_path / "changes.yml"
@@ -168,10 +202,10 @@ def test_scan_and_apply(tmf, tmp_path, monkeypatch):
     }
     assert entries == {
         "Heat/Heat (1995).mp4": movie,
-        "Show/Season 1/02 - Wrong.mkv": episode_fields,
+        "Show/Season 1/02 - Diversity.mkv": episode_fields,
     }
     tmf.run_apply(args)
-    episode = root / "Show" / "Season 1" / "02 - Wrong.mkv"
+    episode = root / "Show" / "Season 1" / "02 - Diversity.mkv"
     assert tmf.read_tags(episode)["title"] == "Diversity Day"
     tmf.run_scan(args)
     assert tmf.load_queue(queue) == {}

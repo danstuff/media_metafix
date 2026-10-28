@@ -54,6 +54,7 @@ from common.steps import convert_extensions, process_each
 from common.text import (
     FUZZY_MATCH_THRESHOLD, FUZZY_SAME_ENOUGH, best_fuzzy_match,
     fuzzy_ratio, leading_int, render_filename, should_replace,
+    titles_agree,
 )
 from common.ui import note, outcome, report, warn, warn_missing_file
 
@@ -266,27 +267,71 @@ def write_tags(path, fields):
 # Lookups: TVmaze (episodes) and TMDB (movies)
 # ---------------------------------------------------------------------------
 
-TVMAZE_SEARCH_URL = "https://api.tvmaze.com/singlesearch/shows"
+TVMAZE_SEARCH_URL = "https://api.tvmaze.com/search/shows"
+TVMAZE_EPISODES_URL = "https://api.tvmaze.com/shows/{}/episodes"
+# Same-named TVmaze shows (e.g. a revival) compared against local files.
+MAX_TVMAZE_CANDIDATES = 5
 TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
 
 
-def tvmaze_episodes(show):
-    """(TVmaze's show name, {(season, episode): title}), or None."""
-    try:
-        data = fetch_json(
-            TVMAZE_SEARCH_URL, {"q": show, "embed": "episodes"},
-            {"User-Agent": USER_AGENT},
-        )
-    except HTTPError as exc:
-        if exc.code == 404:
-            return None
-        raise
-    episodes = data.get("_embedded", {}).get("episodes", [])
-    titles = {
+def tvmaze_search(show):
+    """TVmaze's shows for `show`, best first."""
+    results = fetch_json(
+        TVMAZE_SEARCH_URL, {"q": show}, {"User-Agent": USER_AGENT},
+    )
+    return [r["show"] for r in results]
+
+
+def tvmaze_titles(show_id):
+    """{(season, episode): title} of TVmaze show `show_id`."""
+    episodes = fetch_json(
+        TVMAZE_EPISODES_URL.format(show_id), None,
+        {"User-Agent": USER_AGENT},
+    )
+    return {
         (ep["season"], ep["number"]): ep["name"]
         for ep in episodes if ep.get("number") is not None
     }
-    return data.get("name"), titles
+
+
+def episode_evidence(local, titles):
+    """How well `titles` fits `local` episode guesses: (filename titles
+    agreeing, season/episode numbers that exist)."""
+    keys = [(g, (g["season"], g["episode"])) for g in local]
+    return (
+        sum(key in titles and bool(g["title"])
+            and titles_agree(g["title"], titles[key]) for g, key in keys),
+        sum(key in titles for _g, key in keys),
+    )
+
+
+def tvmaze_episodes(show, local=()):
+    """(TVmaze's show name, {(season, episode): title}), or None. Among
+    shows named `show` (an original and its revival, say), the one best
+    fitting `local` episode guesses; ties go to TVmaze's ranking."""
+    candidates = tvmaze_search(show)
+    if not candidates:
+        return None
+    same_name = [
+        c for c in candidates
+        if fuzzy_ratio(c["name"], show) >= FUZZY_SAME_ENOUGH
+    ][:MAX_TVMAZE_CANDIDATES]
+    if len(same_name) < 2:
+        best = (same_name or candidates)[0]
+        return best["name"], tvmaze_titles(best["id"])
+    scored = [(c["name"], tvmaze_titles(c["id"])) for c in same_name]
+    return max(scored, key=lambda pair: episode_evidence(local, pair[1]))
+
+
+def local_episodes(show_dir):
+    """guess_fields of every video under `show_dir`'s season folders."""
+    if show_dir is None or not show_dir.is_dir():
+        return []
+    return [
+        guess_fields(f"{show_dir.name}/{season.name}/{video.name}")
+        for season in iter_dirs(show_dir)
+        for video in filter(is_video, iter_files(season))
+    ]
 
 
 def tmdb_search(query, year, api_key):
@@ -327,28 +372,37 @@ def tmdb_movie(title, year, api_key, series=None):
     return None
 
 
-def show_episodes(show, args, cache):
-    """{(season, episode): title} for `show`, or None."""
+def show_episodes(show, args, cache, show_dir=None):
+    """{(season, episode): title} for `show`, or None. `show_dir`'s
+    videos pick between same-named shows."""
     if args.no_tvmaze:
         return None
     result = cached(
-        cache, ("tvmaze", show), lambda: tvmaze_episodes(show),
+        cache, ("tvmaze", show),
+        lambda: tvmaze_episodes(show, local_episodes(show_dir)),
         f"TVmaze lookup for {show!r}",
     )
     if result is None:
         return None
     name, titles = result
-    if fuzzy_ratio(name, show) < FUZZY_SAME_ENOUGH:
+    ratio = fuzzy_ratio(name, show)
+    if ratio < FUZZY_MATCH_THRESHOLD:
+        warn(f"TVmaze matched {name!r} for folder {show!r}; ignoring it. "
+             f"Rename the folder to the show's full name.")
+        return None
+    if ratio < FUZZY_SAME_ENOUGH:
         warn(f"TVmaze matched {name!r} for folder {show!r}.")
     return titles
 
 
 def match_episode(guess, titles):
     """(season, episode, title) from `titles` for a guessed episode,
-    by number or else fuzzy title, or None."""
+    or None. By number if the filename's title (if any) agrees, else by
+    fuzzy title."""
     season = guess["season"]
     key = (season, guess["episode"])
-    if key in titles:
+    if key in titles and (not guess["title"]
+                          or titles_agree(guess["title"], titles[key])):
         return (*key, titles[key])
     if not guess["title"]:
         return None
@@ -396,11 +450,17 @@ def episode_updates(path, guess, current, args, cache):
     queue_differences(updates, current, {
         "show": guess["show"], "season": guess["season"],
     })
-    titles = show_episodes(guess["show"], args, cache)
+    titles = show_episodes(guess["show"], args, cache, path.parent.parent)
     match = match_episode(guess, titles) if titles else None
+    numbered = (titles or {}).get((guess["season"], guess["episode"]))
     if match:
         _season, episode, title = match
         found = {"episode": episode, "title": title}
+    elif numbered:
+        warn(f"TVmaze's S{guess['season']:02}E{guess['episode']:02} is "
+             f"{numbered!r}, not {guess['title']!r}; leaving {path} "
+             f"unchanged.")
+        found = {"episode": guess["episode"]}
     else:
         warn(f"No TVmaze match found for {path}")
         found = {"episode": guess["episode"]}

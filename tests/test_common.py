@@ -15,6 +15,18 @@ from common.text import (
 from conftest import write_queue
 
 
+@pytest.mark.parametrize("a, b, agree", [
+    ("George Carlin", "George Carlin / Billy Preston, Janis Ian", True),
+    ("diversity day", "Diversity Day", True),
+    ("George Carlin", "Piotr Adamczyk/Daria Zawiałow", False),
+    ("Day", "Diversity Day", False),  # too short to count as contained
+    (None, "Pilot", False),
+])
+def test_titles_agree(a, b, agree):
+    from common.text import titles_agree
+    assert titles_agree(a, b) == agree
+
+
 def test_leading_int():
     assert leading_int("3/12") == 3
     assert leading_int(" 07") == 7

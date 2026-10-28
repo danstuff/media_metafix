@@ -10,14 +10,11 @@ import pytest
 from conftest import make_video, needs_ffmpeg, write_queue
 
 SRT = b"1\n00:00:00,000 --> 00:00:00,500\nHello\n"
-EPISODES = {
-    "name": "The Office",
-    "_embedded": {"episodes": [
-        {"season": 1, "number": 1, "name": "Pilot"},
-        {"season": 1, "number": 2, "name": "Diversity Day"},
-        {"season": 0, "number": None, "name": "Unnumbered special"},
-    ]},
-}
+EPISODES = [
+    {"season": 1, "number": 1, "name": "Pilot"},
+    {"season": 1, "number": 2, "name": "Diversity Day"},
+    {"season": 0, "number": None, "name": "Unnumbered special"},
+]
 
 
 class FakeApi:
@@ -56,10 +53,6 @@ def fake_api(tmf, monkeypatch):
     return install
 
 
-def not_found(*_args):
-    raise HTTPError("url", 404, "Not Found", {}, None)
-
-
 def subtitle(file_id, hash_match=False, downloads=1, **feature):
     return {"attributes": {
         "moviehash_match": hash_match, "download_count": downloads,
@@ -71,30 +64,83 @@ def subtitle(file_id, hash_match=False, downloads=1, **feature):
 # Metadata lookups
 # ---------------------------------------------------------------------------
 
+def tvmaze_api(fake_api, shows, episodes=None):
+    """TVmaze answering a search with `shows` ({id: name}) and each
+    show's episodes with `episodes[id]` (default EPISODES)."""
+    episodes = episodes or {}
+    api = fake_api(shows=lambda params, body: [
+        {"score": 1, "show": {"id": i, "name": n}} for i, n in shows.items()
+    ])
+    for show_id in shows:
+        api.routes[f"/shows/{show_id}/episodes"] = (
+            lambda params, body, i=show_id: episodes.get(i, EPISODES))
+    return api
+
+
 def test_tvmaze_episodes(tmf, fake_api):
-    api = fake_api(shows=lambda params, body: EPISODES)
+    api = tvmaze_api(fake_api, {1: "The Office", 2: "Office Space"})
     name, titles = tmf.tvmaze_episodes("the office")
     assert name == "The Office"
     assert titles == {(1, 1): "Pilot", (1, 2): "Diversity Day"}
-    _url, params, headers, _body = api.calls[0]
-    assert params == {"q": "the office", "embed": "episodes"}
+    url, params, headers, _body = api.calls[0]
+    assert url == tmf.TVMAZE_SEARCH_URL and params == {"q": "the office"}
     assert headers["User-Agent"] == tmf.USER_AGENT
+    # Only one show is named "the office", so only its episodes load.
+    assert [c[0] for c in api.calls[1:]] == [
+        "https://api.tvmaze.com/shows/1/episodes"]
 
 
 def test_tvmaze_unknown_show(tmf, fake_api):
-    fake_api(shows=not_found)
+    tvmaze_api(fake_api, {})
     assert tmf.tvmaze_episodes("nope") is None
 
 
+REVIVAL = [{"season": 1, "number": 1, "name": "My Return"},
+           {"season": 1, "number": 2, "name": "My 2nd First Day"}]
+ORIGINAL = [{"season": 1, "number": 1, "name": "My First Day"},
+            {"season": 1, "number": 2, "name": "My Mentor"},
+            {"season": 2, "number": 1, "name": "My Overkill"}]
+
+
+@pytest.mark.parametrize("files", [
+    ["Season 1/S01E02 My Mentor.m4v"],      # by title
+    ["Season 1/S01E01.m4v", "Season 2/S02E01.m4v"],   # by numbers
+])
+def test_tvmaze_episodes_picks_between_same_named_shows(
+        tmf, fake_api, tmp_path, files):
+    tvmaze_api(fake_api, {84836: "Scrubs", 532: "Scrubs"},
+               {84836: REVIVAL, 532: ORIGINAL})
+    for file in files:
+        (tmp_path / "Scrubs" / file).parent.mkdir(parents=True,
+                                                 exist_ok=True)
+        (tmp_path / "Scrubs" / file).touch()
+    titles = tmf.show_episodes("Scrubs", Namespace(no_tvmaze=False), {},
+                               tmp_path / "Scrubs")
+    assert titles[(1, 2)] == "My Mentor"
+
+
+def test_tvmaze_episodes_ties_go_to_tvmaze_ranking(tmf, fake_api):
+    tvmaze_api(fake_api, {84836: "Scrubs", 532: "Scrubs"},
+               {84836: REVIVAL, 532: ORIGINAL})
+    assert tmf.tvmaze_episodes("Scrubs")[1][(1, 2)] == "My 2nd First Day"
+
+
 def test_show_episodes_warns_on_other_show(tmf, fake_api, capsys):
-    api = fake_api(shows=lambda params, body: EPISODES)
+    api = tvmaze_api(fake_api, {1: "The Office"})
     args = Namespace(no_tvmaze=False)
     cache = {}
     assert tmf.show_episodes("Office", args, cache)[(1, 1)] == "Pilot"
     assert "TVmaze matched 'The Office' for folder 'Office'" in \
         capsys.readouterr().err
     assert tmf.show_episodes("Office", args, cache)
-    assert len(api.calls) == 1  # cached
+    assert len(api.calls) == 2  # search + episodes, then cached
+
+
+def test_show_episodes_ignores_unrelated_show(tmf, fake_api, capsys):
+    tvmaze_api(fake_api, {1: "SNL Polska"})
+    assert tmf.show_episodes("SNL", Namespace(no_tvmaze=False), {}) is None
+    assert "TVmaze matched 'SNL Polska' for folder 'SNL'; ignoring it" in \
+        capsys.readouterr().err
 
 
 def test_lookup_failure_is_cached_as_none(tmf, fake_api, capsys):

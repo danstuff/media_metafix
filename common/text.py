@@ -38,6 +38,19 @@ def titles_match(a, b):
     return fuzzy_ratio(a, b) >= FUZZY_SAME_ENOUGH
 
 
+MIN_CONTAINED_LENGTH = 4  # shorter texts are "in" too much by chance
+
+
+def titles_agree(a, b):
+    """True if `a` and `b` plausibly name the same thing: similar, or
+    one contains the other ("George Carlin" in "George Carlin / Billy
+    Preston")."""
+    if fuzzy_ratio(a, b) >= FUZZY_MATCH_THRESHOLD:
+        return True
+    a, b = sorted((comparable(a or ""), comparable(b or "")), key=len)
+    return len(a) >= MIN_CONTAINED_LENGTH and a in b
+
+
 def only_case_differs(a, b):
     a, b = (a or "").strip(), (b or "").strip()
     return a != b and a.casefold() == b.casefold()
