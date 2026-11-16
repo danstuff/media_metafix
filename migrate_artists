@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""
+One-off migration for music libraries tagged by older music_metafix
+versions, which kept a recording's full credit in a separate "artists"
+tag. For every audio file under root that has one, this folds the
+featured artists into "artist" as a comma-separated list ("Main,
+Guest") and deletes "artists" -- matching what scan now writes,
+without re-scanning.
+
+The existing "artist" tag (the folder name, as scan wrote it) stays
+the main artist; the first "artists" entry is only used when "artist"
+is missing.
+
+Usage: migrate_artists ROOT [--dry-run]
+
+Temporary: delete this script once your libraries are migrated.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import mutagen
+from mutagen.easyid3 import EasyID3
+from mutagen.easymp4 import EasyMP4Tags
+
+# Same registrations old music_metafix used to write "artists".
+EasyID3.RegisterTXXXKey("artists", "ARTISTS")
+EasyMP4Tags.RegisterFreeformKey("artists", "ARTISTS")
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".wma", ".wav",
+}
+
+
+def merged_artist(artist, artists):
+    """"Main, Feature, ..." from the old artist tag and artists list:
+    artist (or artists[0]) first, then artists[1:] minus repeats of
+    the main artist."""
+    main = (artist or "").strip() or artists[0]
+    features = [
+        a for a in artists[1:] if a.strip().casefold() != main.casefold()
+    ]
+    return ", ".join([main, *features])
+
+
+def migrate_wav(audio):
+    """(old artist, old artists, new artist) for a WAV's raw ID3
+    frames, updated in place; None if it has no ARTISTS frame."""
+    from mutagen.id3 import TPE1
+
+    tags = audio.tags
+    frames = tags.getall("TXXX:ARTISTS") if tags is not None else []
+    if not frames:
+        return None
+    artists = [str(v) for v in frames[0].text if str(v).strip()]
+    artist = str(tags["TPE1"].text[0]) if "TPE1" in tags else None
+    tags.delall("TXXX:ARTISTS")
+    new = merged_artist(artist, artists) if artists else artist
+    if new:
+        tags.add(TPE1(encoding=3, text=new))
+    return artist, artists, new
+
+
+def migrate_easy(audio):
+    """Same as migrate_wav, via mutagen's easy interface."""
+    if "artists" not in audio:
+        return None
+    artists = [str(v) for v in audio["artists"] if str(v).strip()]
+    values = audio.get("artist")
+    artist = str(values[0]) if values else None
+    del audio["artists"]
+    new = merged_artist(artist, artists) if artists else artist
+    if new:
+        audio["artist"] = new
+    return artist, artists, new
+
+
+def migrate_file(path, dry_run):
+    """True if `path` had an "artists" tag (and was, or would be,
+    migrated)."""
+    if path.suffix.lower() == ".wav":
+        audio = mutagen.File(str(path))
+        result = migrate_wav(audio) if audio is not None else None
+    else:
+        audio = mutagen.File(str(path), easy=True)
+        result = migrate_easy(audio) if audio is not None else None
+    if audio is None:
+        print(f"Could not read tags, skipping: {path}", file=sys.stderr)
+        return False
+    if result is None:
+        return False
+    artist, artists, new = result
+    if not dry_run:
+        audio.save()
+    prefix = "Would update" if dry_run else "Updated"
+    print(f"{prefix} {path}: artist {artist!r} + artists {artists!r} "
+          f"-> {new!r}")
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("root", help="Music library root folder.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print changes without writing them.")
+    args = parser.parse_args()
+
+    root = Path(args.root)
+    if not root.is_dir():
+        parser.error(f"not a directory: {root}")
+    migrated = errors = 0
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        try:
+            migrated += migrate_file(path, args.dry_run)
+        except Exception as exc:  # keep going past one bad file
+            print(f"Error on {path}: {exc}", file=sys.stderr)
+            errors += 1
+    verb = "would be migrated" if args.dry_run else "migrated"
+    print(f"\n{migrated} file(s) {verb}, {errors} error(s).")
+
+
+if __name__ == "__main__":
+    main()

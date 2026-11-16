@@ -198,21 +198,22 @@ def test_apply_track_match(mmf):
     mmf.apply_track_match(
         updates, {"title": "second song", "tracknumber": "1"}, 2, match,
     )
-    assert updates == {"title": "Second Song", "tracknumber": "2",
-                       "artists": ["Artist A", "Guest"]}
+    assert updates == {"title": "Second Song", "tracknumber": "2"}
 
 
-def test_queue_fallback_artists(mmf):
+@pytest.mark.parametrize("existing, credited, expected", [
+    (None, ["Artist A", "Guest"], "Artist A, Guest"),
+    ("Artist A", ["Artist A", "Guest"], "Artist A, Guest"),
+    ("Artist A, Old", ["Artist A"], "Artist A"),     # a match wins
+    ("Artist A, Guest", ["Artist A", "Guest"], None),  # already right
+    ("Artist A, Guest", None, None),  # unmatched keeps features
+    ("Wrong, Guest", None, "Artist A"),
+    (None, None, "Artist A"),
+])
+def test_queue_artist(mmf, existing, credited, expected):
     updates = {}
-    mmf.queue_fallback_artists(updates, {"artists": []}, "Artist A")
-    assert updates == {"artists": ["Artist A"]}
-    for current, updates in (
-        ({"artists": ["X", "Y"]}, {}),           # existing credit kept
-        ({}, {"artists": ["From MusicBrainz"]}),  # a match wins
-    ):
-        before = dict(updates)
-        mmf.queue_fallback_artists(updates, current, "Artist A")
-        assert updates == before
+    mmf.queue_artist(updates, {"artist": existing}, "Artist A", credited)
+    assert updates.get("artist") == expected
 
 
 @needs_ffmpeg
@@ -230,9 +231,8 @@ def test_scan_queues_musicbrainz_changes_and_art(mmf, fake_mb, monkeypatch,
         musicbrainz_contact="me@example.com", no_musicbrainz=False,
     ))
     assert mmf.load_queue(queue) == {"Artist A/Album/02 - second.mp3": {
-        "album": "Album", "artist": "Artist A",
-        "artists": ["Artist A", "Guest"], "title": "Second Song",
-        "tracknumber": 2,
+        "album": "Album", "artist": "Artist A, Guest",
+        "title": "Second Song", "tracknumber": 2,
     }}
     assert (art_dir / "Artist A" / "Album" / "art.jpg").exists()
 
@@ -249,8 +249,8 @@ def test_scan_queues_existing_tags_when_unmatched(mmf, tmp_path, capsys):
         musicbrainz_contact="me@example.com", no_musicbrainz=True,
     ))
     assert mmf.load_queue(queue) == {"Artist A/Album/03 - song.mp3": {
-        "album": "Album", "artist": "Artist A", "artists": ["Artist A"],
-        "title": "Song", "tracknumber": 3,
+        "album": "Album", "artist": "Artist A", "title": "Song",
+        "tracknumber": 3,
     }}
     assert "queuing its existing tags" in capsys.readouterr().err
 
@@ -274,9 +274,8 @@ def test_scan_numbers_disc_folders_across_the_album(mmf, fake_mb,
     assert entries["Artist A/Album (Disc 1)/01 - first song.mp3"][
         "tracknumber"] == 1
     assert entries["Artist A/Album (Disc 2)/01 - second song.mp3"] == {
-        "album": "Album", "artist": "Artist A",
-        "artists": ["Artist A", "Guest"], "title": "Second Song",
-        "tracknumber": 2,
+        "album": "Album", "artist": "Artist A, Guest",
+        "title": "Second Song", "tracknumber": 2,
     }
     capsys.readouterr()
 

@@ -9,8 +9,7 @@ from conftest import make_audio, needs_ffmpeg, write_queue
 pytestmark = needs_ffmpeg
 
 TAGS = {
-    "album": "Album", "artist": "Artist A",
-    "artists": ["Artist A", "Guest"], "title": "Song",
+    "album": "Album", "artist": "Artist A, Guest", "title": "Song",
     "tracknumber": "3",
 }
 
@@ -29,8 +28,7 @@ def test_tag_round_trip(mmf, tmp_path, ext):
 def test_untagged_wav_reads_empty(mmf, tmp_path):
     path = make_audio(tmp_path / "song.wav")
     assert read_tags(mmf, path) == {
-        "album": None, "artist": None, "artists": [], "title": None,
-        "tracknumber": None,
+        "album": None, "artist": None, "title": None, "tracknumber": None,
     }
 
 
@@ -48,8 +46,8 @@ def test_apply_writes_tags_and_art(mmf, tmp_path):
     queue.write_text(
         f"# root: {root.resolve()}\n"
         "Artist A/Album/01 - one.mp3:\n"
-        "  album: Album\n  artist: Artist A\n"
-        "  artists: [Artist A, Guest]\n  title: '  One  '\n"
+        "  album: Album\n  artist: Artist A, Guest\n"
+        "  title: '  One  '\n"
         "  tracknumber: 1\n",
         encoding="utf-8",
     )
@@ -63,8 +61,7 @@ def test_apply_writes_tags_and_art(mmf, tmp_path):
     ))
     tags = read_tags(mmf, root / "Artist A" / "Album" / "01 - one.mp3")
     assert tags == {
-        "album": "Album", "artist": "Artist A",
-        "artists": ["Artist A", "Guest"], "title": "One",
+        "album": "Album", "artist": "Artist A, Guest", "title": "One",
         "tracknumber": "1",
     }
     assert (root / "Artist A" / "Album" / "art.jpg").read_bytes() == \
@@ -74,9 +71,9 @@ def test_apply_writes_tags_and_art(mmf, tmp_path):
 
 def test_queue_fields_to_tag_updates_skips_nulls(mmf):
     assert mmf.queue_fields_to_tag_updates({
-        "album": None, "artists": ["A", 2], "title": " T ",
+        "album": None, "artist": "A, B", "title": " T ",
         "tracknumber": 4,
-    }) == {"artists": ["A", "2"], "title": "T", "tracknumber": "4"}
+    }) == {"artist": "A, B", "title": "T", "tracknumber": "4"}
 
 
 def test_rename(mmf, tmp_path, capsys):

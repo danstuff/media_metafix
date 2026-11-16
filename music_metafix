@@ -5,8 +5,8 @@ Verify and fix metadata for a music library laid out as
 
 Folder names are trusted for artist and album. Titles and track numbers
 come from MusicBrainz, matched by the filename's track number or else
-its title. A recording's full credit (main + featured artists) goes in
-a separate "artists" tag; "artist" stays as the folder name.
+its title. "artist" is the folder name, followed by any featured
+artists from MusicBrainz as a comma-separated list ("Main, Guest").
 
 scan only queues changes: metadata to tmp/changes.yml and album art to
 tmp/art (tmp is relative to the current directory, not root). Steps
@@ -43,9 +43,7 @@ except ImportError:
     Image = None
 
 import mutagen
-from mutagen.easyid3 import EasyID3
-from mutagen.easymp4 import EasyMP4Tags
-from mutagen.id3 import TALB, TIT2, TPE1, TRCK, TXXX
+from mutagen.id3 import TALB, TIT2, TPE1, TRCK
 
 from common import check as chk
 from common.cli import (
@@ -74,11 +72,7 @@ from common.ui import (
     missing_package, note, outcome, report, warn, warn_missing_file,
 )
 
-# "artists" needs registering for mp3/m4a; other formats take any key.
-EasyID3.RegisterTXXXKey("artists", "ARTISTS")
-EasyMP4Tags.RegisterFreeformKey("artists", "ARTISTS")
-
-QUEUE_FIELDS = ("album", "artist", "artists", "title", "tracknumber")
+QUEUE_FIELDS = ("album", "artist", "title", "tracknumber")
 AUDIO_EXTENSIONS = {
     ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".wma", ".wav",
 }
@@ -110,14 +104,10 @@ def frame_text(tags, frame_id):
 
 
 def get_tags_wav(audio):
-    tags = audio.tags
-    fields = {
-        key: frame_text(tags, frame.__name__)
+    return {
+        key: frame_text(audio.tags, frame.__name__)
         for key, frame in WAV_FRAMES.items()
     }
-    artists = tags.getall("TXXX:ARTISTS") if tags is not None else []
-    fields["artists"] = [str(v) for v in artists[0].text] if artists else []
-    return fields
 
 
 def get_tags_easy(audio):
@@ -126,9 +116,7 @@ def get_tags_easy(audio):
         values = audio.get(key)
         return str(values[0]) if values else None
 
-    fields = {key: first(key) for key in QUEUE_FIELDS}
-    fields["artists"] = [str(v) for v in audio.get("artists") or []]
-    return fields
+    return {key: first(key) for key in QUEUE_FIELDS}
 
 
 def get_tags(handle):
@@ -140,17 +128,12 @@ def set_tags_wav(audio, updates):
     if audio.tags is None:
         audio.add_tags()
     for key, value in updates.items():
-        if key == "artists":
-            audio.tags.delall("TXXX:ARTISTS")
-            audio.tags.add(TXXX(encoding=3, desc="ARTISTS",
-                                text=list(value)))
-        else:
-            audio.tags.add(WAV_FRAMES[key](encoding=3, text=str(value)))
+        audio.tags.add(WAV_FRAMES[key](encoding=3, text=str(value)))
 
 
 def set_tags_easy(audio, updates):
     for key, value in updates.items():
-        audio[key] = list(value) if key == "artists" else str(value)
+        audio[key] = str(value)
 
 
 def set_tags(handle, updates):
@@ -195,19 +178,43 @@ def strip_filename_track_prefix(stem):
     return FILENAME_TRACK_PREFIX_RE.sub("", stem)
 
 
+def featured_artists(artist, main_artist):
+    """What follows `main_artist` in an "artist" tag, e.g. "B, C" for
+    "A, B, C" -- matched by prefix, since names can contain commas."""
+    artist = (artist or "").strip()
+    prefix = f"{main_artist}, "
+    return artist[len(prefix):] if artist.startswith(prefix) else ""
+
+
+def split_artist(artist, folder_artist):
+    """(main, features) from an "artist" tag like "A, B, C" ->
+    ("A", "B, C"). The artist folder's name is the main artist when
+    the tag starts with it (so "Earth, Wind & Fire" stays whole);
+    otherwise the main artist is the tag's first comma-separated
+    entry."""
+    artist = (artist or "").strip()
+    if artist == folder_artist:
+        return artist, ""
+    features = featured_artists(artist, folder_artist)
+    if features:
+        return folder_artist, features
+    main, _sep, features = artist.partition(", ")
+    return main, features
+
+
 def render_filename(template, path, tags):
     """`template` filled from `tags`, e.g. "%num - %title" ->
     "01 - Song.mp3". Periods are dropped from the title ("Mr. Jones"
     -> "Mr Jones")."""
     track_no = normalize_track(tags.get("tracknumber"))
-    artists = tags.get("artists") or []
     title = (tags.get("title") or "").replace(".", "").strip()
+    main, features = split_artist(tags.get("artist"),
+                                  path.parent.parent.name)
     return render_template(template, path, {
         "%num": f"{track_no:02d}" if track_no is not None else "00",
         "%title": title or path.stem,
-        "%artist": tags.get("artist") or "",
-        # artists[0] is the main artist; the rest are featured.
-        "%features": ", ".join(artists[1:]),
+        "%artist": main,
+        "%features": features,
         "%album": tags.get("album") or "",
     })
 
@@ -557,27 +564,41 @@ def apply_album_art(root, art_dir, dry_run=False):
 # ---------------------------------------------------------------------------
 
 def apply_track_match(updates, current, pos, match):
-    """Queue MusicBrainz's title/number/artists where they differ."""
+    """Queue MusicBrainz's title/number where they differ."""
     if should_replace(match["title"], current.get("title")):
         updates["title"] = match["title"]
     if normalize_track(current.get("tracknumber")) != pos:
         updates["tracknumber"] = str(pos)
-    if match["artists"] and match["artists"] != current.get("artists"):
-        updates["artists"] = match["artists"]
 
 
-def queue_folder_names(updates, current, artist_name, album_name):
-    """Queue the folder-trusted artist/album where tags differ."""
-    if (current.get("artist") or "").strip() != artist_name:
-        updates["artist"] = artist_name
+def queue_folder_album(updates, current, album_name):
+    """Queue the folder-trusted album where the tag differs."""
     if (current.get("album") or "").strip() != album_name:
         updates["album"] = album_name
 
 
-def queue_fallback_artists(updates, current, artist_name):
-    """Without other credits, artists is just the folder's artist."""
-    if "artists" not in updates and not current.get("artists"):
-        updates["artists"] = [artist_name]
+def full_artist(artist_name, credited):
+    """The folder's artist plus the featured artists in MusicBrainz's
+    credit (all but its first, main entry), comma-separated."""
+    features = [
+        a for a in credited[1:] if a.casefold() != artist_name.casefold()
+    ]
+    return ", ".join([artist_name, *features])
+
+
+def queue_artist(updates, current, artist_name, credited):
+    """Queue the folder's artist plus featured artists. Without a
+    MusicBrainz credit, an existing tag that already starts with the
+    folder's artist keeps its features."""
+    existing = (current.get("artist") or "").strip()
+    if credited:
+        wanted = full_artist(artist_name, credited)
+    elif existing == artist_name or featured_artists(existing, artist_name):
+        return
+    else:
+        wanted = artist_name
+    if existing != wanted:
+        updates["artist"] = wanted
 
 
 def queue_filename_track(updates, current, filename_track):
@@ -611,7 +632,7 @@ def compute_scan_change(root, path, args, cache):
     filename_title = strip_filename_track_prefix(path.stem).strip()
 
     updates = {}
-    queue_folder_names(updates, current, artist_name, album_name)
+    queue_folder_album(updates, current, album_name)
     track_map = album_tracks(
         artist_name, album_name, args, cache, track_count,
     ) or {}
@@ -621,8 +642,9 @@ def compute_scan_change(root, path, args, cache):
              f"existing tags.")
     else:
         apply_track_match(updates, current, pos, track_map[pos])
+    credited = track_map[pos]["artists"] if pos is not None else None
+    queue_artist(updates, current, artist_name, credited)
     queue_filename_track(updates, current, filename_track)
-    queue_fallback_artists(updates, current, artist_name)
     # Unmatched files are always queued, so check flags their nulls.
     if not updates and pos is not None:
         return None
@@ -882,11 +904,7 @@ def queue_fields_to_tag_updates(fields):
     updates = {}
     for key in QUEUE_FIELDS:
         value = fields.get(key)
-        if value is None:
-            continue
-        if key == "artists":
-            updates[key] = [str(v) for v in value]
-        else:
+        if value is not None:
             updates[key] = str(value).strip()
     return updates
 
@@ -1024,28 +1042,25 @@ def check_album(lines, stats, album_dir, group):
         lines, stats, album_dir, group, *TRACK, normalize_track,
     )
     check_inconsistent_totals(lines, stats, album_dir, group)
-    for key in ("artist", "album"):
-        chk.check_inconsistent(lines, stats, album_dir, group, key)
+    # Not artist: featured artists vary per track, and
+    # check_artist_matches_folder covers the main artist.
+    chk.check_inconsistent(lines, stats, album_dir, group, "album")
 
 
-def check_artist_matches_artists(lines, stats, file, fields):
-    """Warn if artist isn't artists[0]; they should agree."""
+def check_artist_matches_folder(lines, stats, file, fields):
+    """Warn if artist doesn't start with the artist folder's name."""
     artist = fields.get("artist")
-    artists = fields.get("artists")
-    if not artist or not artists:
+    if not artist:
         return
-    if str(artists[0]).strip() == str(artist).strip():
+    artist = str(artist).strip()
+    folder = Path(file).parts[0]
+    if artist == folder or featured_artists(artist, folder):
         return
     message = (
-        f"{file}: artist {artist!r} doesn't match the first entry in "
-        f"artists {artists!r}."
+        f"{file}: artist {artist!r} doesn't start with the artist "
+        f"folder's name {folder!r}."
     )
-    ok_lines = [
-        chk.find_field_line(lines, file, "artist"),
-        chk.find_field_line(lines, file, "artists"),
-    ]
-    restart_line = chk.find_entry_line(lines, file)
-    chk.resolve_warning(lines, stats, message, ok_lines, restart_line)
+    chk.warn_field(lines, stats, message, file, "artist")
 
 
 def filename_has_disc_track(lines, file):
@@ -1076,7 +1091,7 @@ def check_track(lines, stats, file, fields, group):
         track_number_from_filename,
     )
     chk.check_title_matches_field(lines, stats, file, fields, "artist")
-    check_artist_matches_artists(lines, stats, file, fields)
+    check_artist_matches_folder(lines, stats, file, fields)
 
 
 def run_check_step(args):
@@ -1178,7 +1193,8 @@ def add_rename_args(subparsers):
     rename_p.add_argument(
         "template",
         help="e.g. '%%num - %%title'. Placeholders: %%num, %%title, "
-             "%%artist, %%features (featured artists), %%album, %%ext.",
+             "%%artist (main artist), %%features (featured artists), "
+             "%%album, %%ext.",
     )
     add_dry_run_arg(rename_p)
 
