@@ -94,20 +94,52 @@ def write_queue_entry(queue_f, file, fields, previous):
     os.fsync(queue_f.fileno())
 
 
-def scan_one_file(queue_f, compute, path):
-    """Queue `path`'s change, if any. Returns "queued", "ok" or
-    "error"."""
+def compute_entry(compute, path):
+    """`compute(path)`, or None (after a warning) if it raised."""
     try:
-        entry = compute(path)
+        return compute(path)
     except Exception as exc:
         warn(f"Unexpected error on {path}: {exc}")
-        return "error"
-    if entry is None:
-        print(f"{path}: OK")
-        return "ok"
-    file, fields, previous = entry
-    write_queue_entry(queue_f, file, fields, previous)
-    return "queued"
+        return None
+
+
+def flush_group(queue_f, entries, counts):
+    """Queue every entry of a group if any changed, else report each
+    OK. `entries` is a list of (file, fields, previous, changed)."""
+    write_all = any(changed for *_rest, changed in entries)
+    for file, fields, previous, changed in entries:
+        counts["queued" if changed else "ok"] += 1
+        if write_all:
+            write_queue_entry(queue_f, file, fields, previous)
+        else:
+            print(f"{file}: OK")
+
+
+def scan_to_queue(args, paths, compute, kind, group_key=None):
+    """Write `compute(path)` for each of `paths` to args.queue.
+    `compute` returns (file, fields, previous, changed). Paths with the
+    same `group_key(path)` (default: each path alone) form a group,
+    queued whole if any entry in it changed. Groups must be
+    contiguous in `paths`."""
+    group_key = group_key or (lambda path: path)
+    counts = Counter()
+    queue_path = Path(args.queue)
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(queue_path, "w", encoding="utf-8") as queue_f:
+        write_queue_header(queue_f, args, kind)
+        group, entries = object(), []
+        for path in paths:
+            key = group_key(path)
+            if key != group:
+                flush_group(queue_f, entries, counts)
+                group, entries = key, []
+            entry = compute_entry(compute, path)
+            if entry is None:
+                counts["error"] += 1
+            else:
+                entries.append(entry)
+        flush_group(queue_f, entries, counts)
+    return counts
 
 
 def print_scan_summary(counts, args):
@@ -125,19 +157,6 @@ def print_scan_summary(counts, args):
     else:
         print("\nNo changes needed.")
     print(f"({counts['ok']} already correct, {counts['error']} errors)")
-
-
-def scan_to_queue(args, paths, compute, kind):
-    """Write `compute(path)` for each of `paths` to args.queue.
-    `compute` returns None or (file, fields, previous)."""
-    counts = Counter()
-    queue_path = Path(args.queue)
-    queue_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(queue_path, "w", encoding="utf-8") as queue_f:
-        write_queue_header(queue_f, args, kind)
-        for path in paths:
-            counts[scan_one_file(queue_f, compute, path)] += 1
-    return counts
 
 
 def read_root_header(queue_file):

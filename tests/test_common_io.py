@@ -1,10 +1,12 @@
 """Dry runs, apply's safety checks, scan errors and ffmpeg failures."""
 
+from argparse import Namespace
+
 import pytest
 
 from common.ffmpeg import run_ffmpeg
 from common.files import move
-from common.queue import apply_queue, scan_one_file
+from common.queue import apply_queue, scan_to_queue
 from common.steps import process_each
 from common.ui import past_tense
 from conftest import needs_ffmpeg, write_queue
@@ -104,18 +106,40 @@ def test_apply_queue_dry_run(tmp_path, capsys):
     assert "1 would be applied" in out
 
 
-def test_scan_one_file_outcomes(tmp_path, capsys):
-    def crash(_path):
-        raise ValueError("bad tags")
+def queue_body(path):
+    return path.read_text().split("\n\n", 1)[1]
 
-    with open(tmp_path / "q.yml", "w", encoding="utf-8") as queue_f:
-        assert scan_one_file(queue_f, crash, "x.mkv") == "error"
-        assert scan_one_file(queue_f, lambda _p: None, "y.mkv") == "ok"
-        assert scan_one_file(
-            queue_f, lambda _p: ("z.mkv", {"title": "Z"}, {}), "z.mkv",
-        ) == "queued"
-    assert "Unexpected error on x.mkv: bad tags" in capsys.readouterr().err
-    assert (tmp_path / "q.yml").read_text() == "z.mkv:\n  title: Z\n"
+
+def test_scan_to_queue_outcomes(tmp_path, capsys):
+    def compute(path):
+        if path == "x.mkv":
+            raise ValueError("bad tags")
+        return path, {"title": path[0].upper()}, {}, path == "z.mkv"
+
+    queue = tmp_path / "q.yml"
+    args = Namespace(root=str(tmp_path), queue=str(queue))
+    counts = scan_to_queue(args, ["x.mkv", "y.mkv", "z.mkv"], compute, "Video")
+    assert counts == {"error": 1, "ok": 1, "queued": 1}
+    captured = capsys.readouterr()
+    assert "Unexpected error on x.mkv: bad tags" in captured.err
+    assert "y.mkv: OK" in captured.out
+    assert queue_body(queue) == "z.mkv:\n  title: Z\n"
+
+
+def test_scan_to_queue_writes_whole_changed_groups(tmp_path):
+    def compute(path):
+        return path, {"title": path}, {}, path == "A/2"
+
+    queue = tmp_path / "q.yml"
+    args = Namespace(root=str(tmp_path), queue=str(queue))
+    paths = ["A/1", "A/2", "A/3", "B/1", "B/2"]
+    counts = scan_to_queue(
+        args, paths, compute, "Video", lambda p: p.split("/")[0],
+    )
+    assert counts == {"queued": 1, "ok": 4}
+    assert queue_body(queue) == (
+        "A/1:\n  title: A/1\nA/2:\n  title: A/2\nA/3:\n  title: A/3\n"
+    )
 
 
 @needs_ffmpeg

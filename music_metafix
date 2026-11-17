@@ -616,9 +616,9 @@ def coerce_queue_field(key, value):
 
 
 def compute_scan_change(root, path, args, cache):
-    """None, or (file, fields, previous) for `path`'s queue entry.
-    Files MusicBrainz can't match are queued with their existing tags
-    (missing ones null) for check to flag."""
+    """(file, fields, previous, changed) for `path`'s queue entry.
+    Files MusicBrainz can't match count as changed, so they're queued
+    with their existing tags (missing ones null) for check to flag."""
     current = read_track_tags(path)
     artist_name = path.parent.parent.name
     if path.parent not in cache:
@@ -646,16 +646,16 @@ def compute_scan_change(root, path, args, cache):
     queue_artist(updates, current, artist_name, credited)
     queue_filename_track(updates, current, filename_track)
     # Unmatched files are always queued, so check flags their nulls.
-    if not updates and pos is not None:
-        return None
+    changed = bool(updates) or pos is None
     fields, previous = build_queue_fields(
         current, updates, QUEUE_FIELDS, coerce_queue_field,
     )
-    return str(path.relative_to(root)), fields, previous
+    return str(path.relative_to(root)), fields, previous, changed
 
 
 def run_scan(args):
-    """Queue changes for every file, plus album art unless --no-art."""
+    """Queue changes for every file, plus album art unless --no-art.
+    An album with any change is queued whole."""
     if not configure_musicbrainz(args.musicbrainz_contact):
         missing_package("musicbrainzngs", "musicbrainzngs",
                         "text-search recognition disabled.")
@@ -664,7 +664,7 @@ def run_scan(args):
     counts = scan_to_queue(
         args, iter_music_files(root),
         lambda path: compute_scan_change(root, path, args, cache),
-        "Music",
+        "Music", album_group_key,
     )
     if not args.no_art:
         queue_album_art(root, args.art_dir, args.art_fn,

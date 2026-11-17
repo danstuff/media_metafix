@@ -480,22 +480,27 @@ def movie_updates(path, guess, current, args, cache):
 
 
 def compute_scan_change(root, path, args, cache):
-    """None, or (file, fields, previous) for `path`'s queue entry."""
+    """(file, fields, previous, changed) for `path`'s queue entry."""
     file = str(path.relative_to(root))
     kind = kind_of(file)
     guess = guess_fields(file)
     current = read_tags(path)
     compute = episode_updates if kind == "episode" else movie_updates
     updates = compute(path, guess, current, args, cache)
-    if not updates:
-        return None
     fields, previous = build_queue_fields(current, updates, fields_for(kind))
-    return file, fields, previous
+    return file, fields, previous, bool(updates)
+
+
+def season_group_key(root, path):
+    """An episode's season folder; a movie is its own group."""
+    if kind_of(path.relative_to(root)) == "episode":
+        return path.parent
+    return path
 
 
 def run_scan(args):
     """Queue changes for every video, and download subtitles unless
-    --no-subs."""
+    --no-subs. A season with any change is queued whole."""
     if not require_ffmpeg("read tags"):
         return
     if not args.tmdb_api_key:
@@ -507,7 +512,7 @@ def run_scan(args):
     counts = scan_to_queue(
         args, iter_videos(root),
         lambda path: compute_scan_change(root, path, args, cache),
-        "Video",
+        "Video", lambda path: season_group_key(root, path),
     )
     if subtitles:
         queue_subtitles(root, *subtitles, args.subs_dir)

@@ -106,6 +106,31 @@ def test_scan_leaves_disagreeing_episode(tmf, tmp_path, monkeypatch, capsys):
         "Show/Season 1/1 - George Carlin.mkv"]["title"] is None
 
 
+@needs_ffmpeg
+def test_scan_queues_whole_season(tmf, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    season = root / "Show" / "Season 1"
+    make_video(season / "01 - Pilot.mkv", "-metadata", "show=Show",
+               "-metadata", "season_number=1", "-metadata", "episode_sort=1",
+               "-metadata", "title=Pilot")
+    make_video(season / "02 - Diversity.mkv")
+    make_video(root / "Other" / "Season 1" / "01 - Fine.mkv",
+               "-metadata", "show=Other", "-metadata", "season_number=1",
+               "-metadata", "episode_sort=1", "-metadata", "title=Fine")
+    monkeypatch.setattr(tmf, "tvmaze_episodes", lambda show, local: (
+        show, {(1, 1): "Pilot" if show == "Show" else "Fine",
+               (1, 2): "Diversity Day"},
+    ))
+    queue = tmp_path / "changes.yml"
+    tmf.run_scan(Namespace(
+        root=str(root), queue=str(queue), tmdb_api_key=None,
+        no_tvmaze=False, no_subs=True, dry_run=False,
+    ))
+    assert set(tmf.load_queue(queue)) == {
+        "Show/Season 1/01 - Pilot.mkv", "Show/Season 1/02 - Diversity.mkv",
+    }
+
+
 def test_oshash(tmf, tmp_path):
     path = tmp_path / "zeros.bin"
     path.write_bytes(bytes(131072))
