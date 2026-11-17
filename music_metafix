@@ -441,7 +441,7 @@ def locate_track(track_map, filename_track, filename_title):
 # Album art: `scan` downloads it to tmp/art; `apply` copies it into root.
 # ---------------------------------------------------------------------------
 
-ALBUM_ART_FILENAME = "art.jpg"
+ALBUM_ART_FILENAME = "album.jpg"
 ALBUM_ART_SIZE = (300, 300)
 COVER_ART_ARCHIVE_FRONT_URL = (
     "https://coverartarchive.org/release/{mbid}/front"

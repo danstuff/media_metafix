@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""
+One-off migration for music libraries from older music_metafix
+versions, which saved album art as "art.jpg". VLC looks for
+"album.jpg", which is now scan's default --art-fn, so this renames
+every art.jpg under root to album.jpg in the same folder.
+
+A folder that already has an album.jpg is left alone (both files are
+kept) and reported, so nothing is ever overwritten.
+
+Also works on a pending art queue (e.g. tmp/art), since it mirrors
+root's folders.
+
+Usage: migrate_album_art ROOT [--dry-run]
+
+Temporary: delete this script once your libraries are migrated.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+OLD_NAME = "art.jpg"
+NEW_NAME = "album.jpg"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("root", help="Music library (or art queue) root.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print changes without making them.")
+    args = parser.parse_args()
+
+    root = Path(args.root)
+    if not root.is_dir():
+        parser.error(f"not a directory: {root}")
+    renamed = skipped = errors = 0
+    for old in sorted(root.rglob(OLD_NAME)):
+        if not old.is_file():
+            continue
+        new = old.with_name(NEW_NAME)
+        if new.exists():
+            print(f"Skipping, {NEW_NAME} already exists: {old}")
+            skipped += 1
+            continue
+        try:
+            if not args.dry_run:
+                old.rename(new)
+        except OSError as exc:  # keep going past one bad folder
+            print(f"Error on {old}: {exc}", file=sys.stderr)
+            errors += 1
+            continue
+        prefix = "Would rename" if args.dry_run else "Renamed"
+        print(f"{prefix} {old} -> {NEW_NAME}")
+        renamed += 1
+    verb = "would be renamed" if args.dry_run else "renamed"
+    print(f"\n{renamed} file(s) {verb}, {skipped} skipped, "
+          f"{errors} error(s).")
+
+
+if __name__ == "__main__":
+    main()
