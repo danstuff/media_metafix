@@ -7,6 +7,8 @@ Folder names are trusted for artist and album. Titles and track numbers
 come from MusicBrainz, matched by the filename's track number or else
 its title. "artist" is the folder name, followed by any featured
 artists from MusicBrainz as a comma-separated list ("Main, Guest").
+"genre" fills in missing genres from the album's (else the artist's)
+top-voted MusicBrainz tag.
 
 scan only queues changes: metadata to tmp/changes.yml and album art to
 tmp/art (tmp is relative to the current directory, not root). Steps
@@ -43,7 +45,7 @@ except ImportError:
     Image = None
 
 import mutagen
-from mutagen.id3 import TALB, TIT2, TPE1, TRCK
+from mutagen.id3 import TALB, TCON, TIT2, TPE1, TRCK
 
 from common import check as chk
 from common.cli import (
@@ -72,7 +74,7 @@ from common.ui import (
     missing_package, note, outcome, report, warn, warn_missing_file,
 )
 
-QUEUE_FIELDS = ("album", "artist", "title", "tracknumber")
+QUEUE_FIELDS = ("album", "artist", "genre", "title", "tracknumber")
 AUDIO_EXTENSIONS = {
     ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".wma", ".wav",
 }
@@ -84,7 +86,7 @@ DEFAULT_ART_DIR = str(Path(DEFAULT_TMP_DIR) / "art")
 # ID3 frames.
 # ---------------------------------------------------------------------------
 
-WAV_FRAMES = {"album": TALB, "artist": TPE1, "title": TIT2,
+WAV_FRAMES = {"album": TALB, "artist": TPE1, "genre": TCON, "title": TIT2,
               "tracknumber": TRCK}
 
 
@@ -387,18 +389,86 @@ def credited_artists(recording):
     ]
 
 
+# Popular MusicBrainz tags that aren't genres.
+NON_GENRE_TAGS = {
+    "seen live", "favorites", "favourites", "albums i own", "owned",
+    "american", "british", "english", "uk", "usa", "canadian",
+    "australian", "german", "french", "swedish", "japanese",
+    "male vocalists", "female vocalists", "singer-songwriter",
+}
+LOWERCASE_GENRE_WORDS = {"and", "n", "of", "the"}
+
+
+def format_genre(tag):
+    """"hip-hop" -> "Hip-Hop", "r&b" -> "R&B", "drum and bass" ->
+    "Drum and Bass"."""
+    first = True
+
+    def capitalize(match):
+        nonlocal first
+        word = match.group(0)
+        if not first and word in LOWERCASE_GENRE_WORDS:
+            return word
+        first = False
+        return word[:1].upper() + word[1:]
+
+    return re.sub(r"[^\W_]+", capitalize, " ".join(tag.split()))
+
+
+def top_genre(entity):
+    """The most-voted genre-like tag on a MusicBrainz entity, or None."""
+    tags = [
+        tag for tag in entity.get("tag-list") or []
+        if tag.get("name")
+        and tag["name"].strip().casefold() not in NON_GENRE_TAGS
+    ]
+    if not tags:
+        return None
+    best = max(tags, key=lambda tag: int(tag.get("count") or 0))
+    return format_genre(best["name"])
+
+
+def release_genre(release):
+    """The genre for a release (looked up with "release-groups" and
+    "artist-credits"): its release group's top tag, else its main
+    artist's. Lookup failures are warned about, never raised."""
+    group_id = (release.get("release-group") or {}).get("id")
+    credit = [c for c in release.get("artist-credit") or []
+              if isinstance(c, dict) and "artist" in c]
+    artist_id = credit[0]["artist"].get("id") if credit else None
+    lookups = (
+        (group_id, "get_release_group_by_id", "release-group"),
+        (artist_id, "get_artist_by_id", "artist"),
+    )
+    for mbid, lookup_name, key in lookups:
+        if not mbid:
+            continue
+        lookup = getattr(musicbrainzngs, lookup_name)
+        try:
+            genre = top_genre(lookup(mbid, includes=["tags"])[key])
+        except Exception as exc:
+            warn(f"MusicBrainz {key} tag lookup failed for {mbid}: {exc}")
+            continue
+        if genre:
+            return genre
+    return None
+
+
 def recognize_via_musicbrainz_text(artist_name, album_name,
                                    track_count=None):
-    """{position: {"title", "artists"}} for an album, or None.
+    """{position: {"title", "artists", "genre"}} for an album, or None.
     Positions restart on each medium (disc, vinyl side), so each is
     offset by the earlier media's track counts: with 5 tracks on side
-    A, B2 is position 7."""
+    A, B2 is position 7. "genre" is the album's, so every track shares
+    it."""
     release_id = find_release_id(artist_name, album_name, track_count)
     if not release_id:
         return None
     full = musicbrainzngs.get_release_by_id(
-        release_id, includes=["recordings", "artist-credits"],
+        release_id,
+        includes=["recordings", "artist-credits", "release-groups"],
     )
+    genre = release_genre(full["release"])
     track_map = {}
     offset = 0
     for medium in full["release"].get("medium-list", []):
@@ -408,6 +478,7 @@ def recognize_via_musicbrainz_text(artist_name, album_name,
             track_map[offset + int(track["position"])] = {
                 "title": recording["title"],
                 "artists": credited_artists(recording),
+                "genre": genre,
             }
         offset += len(tracks)
     return track_map or None
@@ -586,6 +657,13 @@ def full_artist(artist_name, credited):
     return ", ".join([artist_name, *features])
 
 
+def queue_genre(updates, current, genre):
+    """Queue MusicBrainz's genre for tracks without one; existing
+    genres are kept."""
+    if genre and not (current.get("genre") or "").strip():
+        updates["genre"] = genre
+
+
 def queue_artist(updates, current, artist_name, credited):
     """Queue the folder's artist plus featured artists. Without a
     MusicBrainz credit, an existing tag that already starts with the
@@ -644,6 +722,8 @@ def compute_scan_change(root, path, args, cache):
         apply_track_match(updates, current, pos, track_map[pos])
     credited = track_map[pos]["artists"] if pos is not None else None
     queue_artist(updates, current, artist_name, credited)
+    if pos is not None:
+        queue_genre(updates, current, track_map[pos].get("genre"))
     queue_filename_track(updates, current, filename_track)
     # Unmatched files are always queued, so check flags their nulls.
     changed = bool(updates) or pos is None
@@ -1077,7 +1157,11 @@ def filename_has_disc_track(lines, file):
 def check_track(lines, stats, file, fields, group):
     """Per-track checks. Titles aren't checked against the album:
     eponymous tracks are common."""
-    chk.check_null_and_blank_fields(lines, stats, file, fields)
+    # Many albums have no MusicBrainz tags, so a null genre is normal.
+    chk.check_null_and_blank_fields(lines, stats, file, {
+        key: value for key, value in fields.items()
+        if not (key == "genre" and value is None)
+    })
     chk.check_is_int(lines, stats, file, fields, *TRACK)
     chk.check_in_range(lines, stats, file, fields, group, *TRACK)
     chk.check_nonzero(lines, stats, file, fields, *TRACK)

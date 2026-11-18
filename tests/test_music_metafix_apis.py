@@ -11,7 +11,10 @@ import pytest
 
 from conftest import make_audio, needs_ffmpeg, write_queue
 
-RELEASE = {"release": {"medium-list": [{"track-list": [
+RELEASE = {"release": {
+    "release-group": {"id": "group-1"},
+    "artist-credit": [{"artist": {"id": "artist-1", "name": "Artist A"}}],
+    "medium-list": [{"track-list": [
     {"position": "1", "recording": {
         "title": "First Song",
         "artist-credit": [{"artist": {"name": "Artist A"}}],
@@ -23,7 +26,8 @@ RELEASE = {"release": {"medium-list": [{"track-list": [
             {"artist": {"name": "Guest"}},
         ],
     }},
-]}]}}
+]}],
+}}
 
 
 class FakeMusicBrainz:
@@ -47,6 +51,18 @@ class FakeMusicBrainz:
     def get_release_by_id(self, release_id, includes):
         assert release_id == "mbid-1"
         return RELEASE
+
+    def get_release_group_by_id(self, group_id, includes):
+        assert (group_id, includes) == ("group-1", ["tags"])
+        return {"release-group": {"tag-list": [
+            {"name": "seen live", "count": "9"},
+            {"name": "hip hop", "count": "4"},
+            {"name": "jazz", "count": "1"},
+        ]}}
+
+    def get_artist_by_id(self, artist_id, includes):
+        assert (artist_id, includes) == ("artist-1", ["tags"])
+        return {"artist": {"tag-list": [{"name": "funk", "count": "2"}]}}
 
 
 class FakeAcoustid:
@@ -104,8 +120,10 @@ def jpeg_bytes():
 
 def test_recognize_via_musicbrainz_text(mmf, fake_mb):
     assert mmf.recognize_via_musicbrainz_text("Artist A", "Album") == {
-        1: {"title": "First Song", "artists": ["Artist A"]},
-        2: {"title": "Second Song", "artists": ["Artist A", "Guest"]},
+        1: {"title": "First Song", "artists": ["Artist A"],
+            "genre": "Hip Hop"},
+        2: {"title": "Second Song", "artists": ["Artist A", "Guest"],
+            "genre": "Hip Hop"},
     }
     assert fake_mb.searches == [("Artist A", "Album")]
 
@@ -126,6 +144,49 @@ def test_recognize_numbers_later_media_after_earlier_ones(mmf, fake_mb,
     assert {pos: data["title"] for pos, data in track_map.items()} == {
         1: "A1", 2: "A2", 3: "A3", 4: "B1", 5: "B2",
     }
+
+
+def test_genre_falls_back_to_artist_tags(mmf, fake_mb, monkeypatch):
+    monkeypatch.setattr(fake_mb, "get_release_group_by_id",
+                        lambda _id, includes: {"release-group": {}})
+    track_map = mmf.recognize_via_musicbrainz_text("Artist A", "Album")
+    assert track_map[1]["genre"] == "Funk"
+
+
+def test_genre_lookup_failure_keeps_tracks(mmf, fake_mb, monkeypatch,
+                                           capsys):
+    def fail(_id, includes):
+        raise OSError("down")
+    monkeypatch.setattr(fake_mb, "get_release_group_by_id", fail)
+    monkeypatch.setattr(fake_mb, "get_artist_by_id", fail)
+    track_map = mmf.recognize_via_musicbrainz_text("Artist A", "Album")
+    assert track_map[2]["title"] == "Second Song"
+    assert track_map[2]["genre"] is None
+    assert "tag lookup failed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tag, expected", [
+    ("rock", "Rock"),
+    ("drum and bass", "Drum and Bass"),
+    ("r&b", "R&B"),
+    ("hip-hop", "Hip-Hop"),
+    ("rock 'n' roll", "Rock 'n' Roll"),
+    ("the the", "The the"),
+])
+def test_format_genre(mmf, tag, expected):
+    assert mmf.format_genre(tag) == expected
+
+
+@pytest.mark.parametrize("existing, genre, expected", [
+    (None, "Rock", "Rock"),
+    ("  ", "Rock", "Rock"),
+    ("Jazz", "Rock", None),   # existing genres are kept
+    (None, None, None),
+])
+def test_queue_genre(mmf, existing, genre, expected):
+    updates = {}
+    mmf.queue_genre(updates, {"genre": existing}, genre)
+    assert updates.get("genre") == expected
 
 
 def test_recognize_no_release(mmf, fake_mb):
@@ -231,7 +292,7 @@ def test_scan_queues_musicbrainz_changes_and_art(mmf, fake_mb, monkeypatch,
         musicbrainz_contact="me@example.com", no_musicbrainz=False,
     ))
     assert mmf.load_queue(queue) == {"Artist A/Album/02 - second.mp3": {
-        "album": "Album", "artist": "Artist A, Guest",
+        "album": "Album", "artist": "Artist A, Guest", "genre": "Hip Hop",
         "title": "Second Song", "tracknumber": 2,
     }}
     assert (art_dir / "Artist A" / "Album" / "art.jpg").exists()
@@ -249,10 +310,31 @@ def test_scan_queues_existing_tags_when_unmatched(mmf, tmp_path, capsys):
         musicbrainz_contact="me@example.com", no_musicbrainz=True,
     ))
     assert mmf.load_queue(queue) == {"Artist A/Album/03 - song.mp3": {
-        "album": "Album", "artist": "Artist A", "title": "Song",
-        "tracknumber": 3,
+        "album": "Album", "artist": "Artist A", "genre": None,
+        "title": "Song", "tracknumber": 3,
     }}
+    assert "  genre: null\n" in queue.read_text(encoding="utf-8")
     assert "queuing its existing tags" in capsys.readouterr().err
+
+
+@needs_ffmpeg
+def test_scan_writes_null_genre_for_untagged_albums(mmf, fake_mb,
+                                                    monkeypatch, tmp_path):
+    monkeypatch.setattr(fake_mb, "get_release_group_by_id",
+                        lambda _id, includes: {"release-group": {}})
+    monkeypatch.setattr(fake_mb, "get_artist_by_id",
+                        lambda _id, includes: {"artist": {}})
+    root = tmp_path / "root"
+    make_audio(root / "Artist A" / "Album" / "01 - first song.mp3")
+    queue = tmp_path / "q.yml"
+    mmf.run_scan(Namespace(
+        root=str(root), queue=str(queue), no_art=True,
+        musicbrainz_contact="me@example.com", no_musicbrainz=False,
+    ))
+    text = queue.read_text(encoding="utf-8")
+    assert "  genre: null\n" in text
+    assert mmf.load_queue(queue)["Artist A/Album/01 - first song.mp3"][
+        "title"] == "First Song"
 
 
 @needs_ffmpeg
@@ -274,7 +356,7 @@ def test_scan_numbers_disc_folders_across_the_album(mmf, fake_mb,
     assert entries["Artist A/Album (Disc 1)/01 - first song.mp3"][
         "tracknumber"] == 1
     assert entries["Artist A/Album (Disc 2)/01 - second song.mp3"] == {
-        "album": "Album", "artist": "Artist A, Guest",
+        "album": "Album", "artist": "Artist A, Guest", "genre": "Hip Hop",
         "title": "Second Song", "tracknumber": 2,
     }
     capsys.readouterr()
