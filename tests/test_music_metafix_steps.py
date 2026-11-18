@@ -128,6 +128,16 @@ def test_check_track_totals(mmf, tmp_path, answer, capsys):
     assert "disagree on the total track count" in capsys.readouterr().out
 
 
+def test_check_album_genres(mmf, tmp_path, answer, capsys):
+    queue = write_queue(tmp_path / "q.yml", (
+        "A/B/1.mp3: {title: One, tracknumber: 1, genre: Rock}\n"
+        "A/B/2.mp3: {title: Two, tracknumber: 2, genre: Jazz}\n"
+    ))
+    answer("2")
+    mmf.run_check_step(Namespace(queue=queue))
+    assert "entries disagree on genre" in capsys.readouterr().out
+
+
 def test_check_accepts_disc_relative_filename_numbers(mmf, tmp_path,
                                                      answer, capsys):
     queue = write_queue(tmp_path / "q.yml", (

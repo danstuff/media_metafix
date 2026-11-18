@@ -1140,6 +1140,7 @@ def check_album(lines, stats, album_dir, group):
     # Not artist: featured artists vary per track, and
     # check_artist_matches_folder covers the main artist.
     chk.check_inconsistent(lines, stats, album_dir, group, "album")
+    chk.check_inconsistent(lines, stats, album_dir, group, "genre")
 
 
 def check_artist_matches_folder(lines, stats, file, fields):
