@@ -97,7 +97,7 @@ def test_scan_leaves_disagreeing_episode(tmf, tmp_path, monkeypatch, capsys):
     queue = tmp_path / "changes.yml"
     tmf.run_scan(Namespace(
         root=str(root), queue=str(queue), tmdb_api_key=None,
-        no_tvmaze=False, no_subs=True, dry_run=False,
+        no_tvmaze=False, no_subs=True, dry_run=False, only=None,
     ))
     assert "TVmaze's S01E01 is 'Piotr Adamczyk/Daria Zawiałow', not " \
         "'George Carlin'" in capsys.readouterr().err
@@ -124,7 +124,7 @@ def test_scan_queues_whole_season(tmf, tmp_path, monkeypatch):
     queue = tmp_path / "changes.yml"
     tmf.run_scan(Namespace(
         root=str(root), queue=str(queue), tmdb_api_key=None,
-        no_tvmaze=False, no_subs=True, dry_run=False,
+        no_tvmaze=False, no_subs=True, dry_run=False, only=None,
     ))
     assert set(tmf.load_queue(queue)) == {
         "Show/Season 1/01 - Pilot.mkv", "Show/Season 1/02 - Diversity.mkv",
@@ -216,7 +216,7 @@ def test_scan_and_apply(tmf, tmp_path, monkeypatch):
     queue = tmp_path / "changes.yml"
     args = Namespace(
         root=str(root), queue=str(queue), tmdb_api_key=None,
-        no_tvmaze=False, no_subs=True, dry_run=False,
+        no_tvmaze=False, no_subs=True, dry_run=False, only=None,
         subs_dir=str(tmp_path / "subtitles"),
     )
     tmf.run_scan(args)
@@ -384,7 +384,7 @@ def test_scan_without_tvmaze_uses_filename(tmf, tmp_path, capsys):
     queue = tmp_path / "q.yml"
     tmf.run_scan(Namespace(root=str(root), queue=str(queue),
                            tmdb_api_key=None, no_tvmaze=True,
-                           no_subs=True))
+                           no_subs=True, only=None))
     assert "No TVmaze match found" in capsys.readouterr().err
     assert tmf.load_queue(queue) == {"Show/Season 3/S03E07 - Seven.mkv": {
         "show": "Show", "season": 3, "episode": 7, "title": None,

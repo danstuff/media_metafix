@@ -242,6 +242,7 @@ def test_scan_uses_tmdb(tmf, fake_api, tmp_path):
     tmf.run_scan(Namespace(
         root=str(root), queue=str(queue), tmdb_api_key="key",
         no_tvmaze=True, no_subs=True,
+        only=None,
     ))
     assert tmf.load_queue(queue) == {
         "Harry Potter/Sorcerers Stone (2001).mkv": {
@@ -251,6 +252,42 @@ def test_scan_uses_tmdb(tmf, fake_api, tmp_path):
         },
     }
 
+
+
+@needs_ffmpeg
+def test_scan_only_queues_given_fields(tmf, fake_api, tmp_path):
+    api = fake_api(movie=lambda params, body: {"results": [{
+        "title": "Harry Potter and the Philosopher's Stone",
+        "release_date": "2001-11-16",
+    }]})
+    root = tmp_path / "root"
+    make_video(root / "Harry Potter" / "Sorcerers Stone (2001).mkv")
+    make_video(root / "Show" / "Season 2" / "S02E05 - X.mkv")
+    queue = tmp_path / "q.yml"
+    tmf.run_scan(Namespace(
+        root=str(root), queue=str(queue), tmdb_api_key="key",
+        no_tvmaze=True, no_subs=False, only=("year",),
+    ))
+    assert tmf.load_queue(queue) == {
+        "Harry Potter/Sorcerers Stone (2001).mkv": {"year": 2001},
+    }
+    assert api.requests_to("/subtitles") == []  # --only skips subtitles
+
+
+@needs_ffmpeg
+def test_scan_only_folder_fields_skips_lookups(tmf, fake_api, tmp_path):
+    api = fake_api()
+    root = tmp_path / "root"
+    make_video(root / "Show" / "Season 2" / "S02E05 - X.mkv")
+    queue = tmp_path / "q.yml"
+    tmf.run_scan(Namespace(
+        root=str(root), queue=str(queue), tmdb_api_key="key",
+        no_tvmaze=False, no_subs=True, only=("show", "season"),
+    ))
+    assert tmf.load_queue(queue) == {
+        "Show/Season 2/S02E05 - X.mkv": {"show": "Show", "season": 2},
+    }
+    assert api.calls == []
 
 # ---------------------------------------------------------------------------
 # OpenSubtitles client
@@ -364,6 +401,7 @@ def scan_args(root, tmp_path, lang="en"):
     return Namespace(
         root=str(root), queue=str(tmp_path / "q.yml"), tmdb_api_key=None,
         no_tvmaze=True, no_subs=False, sub_lang=lang,
+        only=None,
         subs_dir=str(tmp_path / "subtitles"),
         opensubtitles_api_key="key", opensubtitles_username=None,
     )

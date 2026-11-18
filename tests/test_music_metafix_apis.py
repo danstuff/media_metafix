@@ -290,12 +290,66 @@ def test_scan_queues_musicbrainz_changes_and_art(mmf, fake_mb, monkeypatch,
         root=str(root), queue=str(queue), no_art=False,
         art_dir=str(art_dir), art_fn="art.jpg",
         musicbrainz_contact="me@example.com", no_musicbrainz=False,
+        only=None,
     ))
     assert mmf.load_queue(queue) == {"Artist A/Album/02 - second.mp3": {
         "album": "Album", "artist": "Artist A, Guest", "genre": "Hip Hop",
         "title": "Second Song", "tracknumber": 2,
     }}
     assert (art_dir / "Artist A" / "Album" / "art.jpg").exists()
+
+
+@needs_ffmpeg
+def test_scan_only_queues_given_fields(mmf, fake_mb, monkeypatch, tmp_path):
+    monkeypatch.setattr(mmf, "fetch_cover_art", lambda _id: jpeg_bytes())
+    root = tmp_path / "root"
+    make_audio(root / "Artist A" / "Album" / "02 - second.mp3",
+               "-metadata", "title=old")
+    make_audio(root / "Artist A" / "Album" / "01 - first song.mp3",
+               "-metadata", "title=First Song", "-metadata", "genre=Rock")
+    queue = tmp_path / "q.yml"
+    art_dir = tmp_path / "art"
+    mmf.run_scan(Namespace(
+        root=str(root), queue=str(queue), no_art=False,
+        art_dir=str(art_dir), art_fn="art.jpg",
+        musicbrainz_contact="me@example.com", no_musicbrainz=False,
+        only=("genre", "title"),
+    ))
+    assert mmf.load_queue(queue) == {
+        "Artist A/Album/01 - first song.mp3": {
+            "genre": "Rock", "title": "First Song",
+        },
+        "Artist A/Album/02 - second.mp3": {
+            "genre": "Hip Hop", "title": "Second Song",
+        },
+    }
+    assert not art_dir.exists()  # --only skips album art
+
+
+@needs_ffmpeg
+def test_scan_only_folder_fields_skips_musicbrainz(mmf, fake_mb, tmp_path):
+    root = tmp_path / "root"
+    make_audio(root / "Artist A" / "Album" / "01 - first song.mp3",
+               "-metadata", "album=Wrong")
+    queue = tmp_path / "q.yml"
+    mmf.run_scan(Namespace(
+        root=str(root), queue=str(queue), no_art=True,
+        musicbrainz_contact="me@example.com", no_musicbrainz=False,
+        only=("album",),
+    ))
+    assert mmf.load_queue(queue) == {
+        "Artist A/Album/01 - first song.mp3": {"album": "Album"},
+    }
+    assert fake_mb.searches == []
+
+
+def test_scan_only_arg(mmf):
+    parser = mmf.build_arg_parser()
+    args = parser.parse_args(["scan", "r", "--only", "title, genre"])
+    assert args.only == ("title", "genre")
+    assert parser.parse_args(["scan", "r"]).only is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(["scan", "r", "--only", "year"])
 
 
 @needs_ffmpeg
@@ -308,6 +362,7 @@ def test_scan_queues_existing_tags_when_unmatched(mmf, tmp_path, capsys):
     mmf.run_scan(Namespace(
         root=str(root), queue=str(queue), no_art=True,
         musicbrainz_contact="me@example.com", no_musicbrainz=True,
+        only=None,
     ))
     assert mmf.load_queue(queue) == {"Artist A/Album/03 - song.mp3": {
         "album": "Album", "artist": "Artist A", "genre": None,
@@ -330,6 +385,7 @@ def test_scan_writes_null_genre_for_untagged_albums(mmf, fake_mb,
     mmf.run_scan(Namespace(
         root=str(root), queue=str(queue), no_art=True,
         musicbrainz_contact="me@example.com", no_musicbrainz=False,
+        only=None,
     ))
     text = queue.read_text(encoding="utf-8")
     assert "  genre: null\n" in text
@@ -350,6 +406,7 @@ def test_scan_numbers_disc_folders_across_the_album(mmf, fake_mb,
     mmf.run_scan(Namespace(
         root=str(root), queue=str(queue), no_art=True,
         musicbrainz_contact="me@example.com", no_musicbrainz=False,
+        only=None,
     ))
     entries = mmf.load_queue(queue)
     assert fake_mb.searches == [("Artist A", "Album")]
@@ -589,6 +646,7 @@ def test_scan_with_custom_art_filename(mmf, fake_mb, monkeypatch,
         root=str(root), queue=str(tmp_path / "q.yml"), no_art=False,
         art_dir=str(art_dir), art_fn="cover.png",
         musicbrainz_contact="me@example.com", no_musicbrainz=True,
+        only=None,
     ))
     assert sorted(p.relative_to(art_dir).as_posix()
                   for p in art_dir.rglob("*.*")) == ["A/No Cover/cover.png"]

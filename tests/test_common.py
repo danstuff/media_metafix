@@ -187,3 +187,24 @@ def test_cli_parser_requires_step():
     assert parser.parse_args(["demo"]) == Namespace(step="demo")
     with pytest.raises(SystemExit):
         parser.parse_args([])
+
+
+def test_parse_only_splits_dedupes_and_validates():
+    import argparse
+    from common.cli import parse_only
+
+    choices = ("album", "genre", "title")
+    assert parse_only("Title, genre,title", choices) == ("title", "genre")
+    with pytest.raises(argparse.ArgumentTypeError, match="'year'"):
+        parse_only("title, year", choices)
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_only(" , ", choices)
+
+
+def test_scan_fields_keeps_canonical_order():
+    from common.queue import scan_fields
+
+    keys = ("album", "genre", "title")
+    assert scan_fields(keys, Namespace(only=None)) == keys
+    assert scan_fields(keys, Namespace(only=("title", "album"))) == \
+        ("album", "title")

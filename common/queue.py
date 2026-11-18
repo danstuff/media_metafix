@@ -46,6 +46,18 @@ def blank_to_none(value):
     return None if value in ("", []) else value
 
 
+def scan_fields(keys, args):
+    """`keys`, cut down to the `--only` fields, if any were given."""
+    if not args.only:
+        return keys
+    return tuple(k for k in keys if k in args.only)
+
+
+def restrict_updates(updates, keys):
+    """`updates` without keys outside `keys`."""
+    return {k: v for k, v in updates.items() if k in keys}
+
+
 def build_queue_fields(current, updates, keys, coerce=None):
     """(fields, previous): `fields` has every key in `keys`, from
     `updates` else `current`; `previous` has old values of updated

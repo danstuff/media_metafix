@@ -78,6 +78,10 @@ review, and downloads album art (for music) or missing subtitles (for TV) into
 delete a field to skip that change, or an entry to skip that file;
 delete a downloaded file to skip it too.
 
+To scan only some fields, pass `--only` a comma-separated list, e.g.
+`music_metafix scan /music --only "title, genre"`. The queue then holds
+just those fields, and art/subtitle downloads are skipped.
+
 `apply` writes the queue, then copies in the art or embeds the subtitles. 
 
 `check` interactively flags things like duplicate or missing track/episode

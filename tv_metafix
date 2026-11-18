@@ -34,8 +34,8 @@ from urllib.error import HTTPError, URLError
 from common import check as chk
 from common.cli import (
     DEFAULT_TMP_DIR, SCANNED_ROOT_HELP, add_check_parser, add_convert_parser,
-    add_dir_arg, add_dry_run_arg, add_queue_arg, add_root_arg, build_parser,
-    run_step,
+    add_dir_arg, add_dry_run_arg, add_only_arg, add_queue_arg, add_root_arg,
+    build_parser, run_step,
 )
 from common.ffmpeg import (
     ffprobe_json, replace_with, require_ffmpeg, run_ffmpeg,
@@ -48,7 +48,7 @@ from common.files import (
 from common.http import cached, fetch, fetch_json
 from common.queue import (
     apply_queue, build_queue_fields, load_queue, print_scan_summary,
-    scan_to_queue, verify_queue_root,
+    restrict_updates, scan_fields, scan_to_queue, verify_queue_root,
 )
 from common.steps import convert_extensions, process_each
 from common.text import (
@@ -70,6 +70,10 @@ ALBUM_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi"}
 EPISODE_FIELDS = ("show", "season", "episode", "title")
 MOVIE_FIELDS = ("series", "title", "year")
 INT_FIELDS = {"season", "episode", "year"}
+# Every queue field, for --only.
+ALL_FIELDS = tuple(dict.fromkeys(EPISODE_FIELDS + MOVIE_FIELDS))
+# Queue fields scan takes from folder names alone, without a lookup.
+FOLDER_FIELDS = {"show", "season", "series"}
 
 # Queue field -> container tag.
 TAG_KEYS = {
@@ -446,11 +450,13 @@ def queue_differences(updates, current, found):
             updates[field] = value
 
 
-def episode_updates(path, guess, current, args, cache):
+def episode_updates(path, guess, current, args, cache, keys):
     updates = {}
     queue_differences(updates, current, {
         "show": guess["show"], "season": guess["season"],
     })
+    if set(keys) <= FOLDER_FIELDS:
+        return updates
     titles = show_episodes(guess["show"], args, cache, path.parent.parent)
     match = match_episode(guess, titles) if titles else None
     numbered = (titles or {}).get((guess["season"], guess["episode"]))
@@ -469,9 +475,11 @@ def episode_updates(path, guess, current, args, cache):
     return updates
 
 
-def movie_updates(path, guess, current, args, cache):
+def movie_updates(path, guess, current, args, cache, keys):
     updates = {}
     queue_differences(updates, current, {"series": guess["series"]})
+    if set(keys) <= FOLDER_FIELDS:
+        return updates
     match = match_movie(guess, args, cache)
     if not match:
         warn(f"No TMDB match found for {path}, using its filename.")
@@ -485,9 +493,14 @@ def compute_scan_change(root, path, args, cache):
     kind = kind_of(file)
     guess = guess_fields(file)
     current = read_tags(path)
+    keys = scan_fields(fields_for(kind), args)
+    if not keys:
+        return file, {}, {}, False
     compute = episode_updates if kind == "episode" else movie_updates
-    updates = compute(path, guess, current, args, cache)
-    fields, previous = build_queue_fields(current, updates, fields_for(kind))
+    updates = restrict_updates(
+        compute(path, guess, current, args, cache, keys), keys,
+    )
+    fields, previous = build_queue_fields(current, updates, keys)
     return file, fields, previous, bool(updates)
 
 
@@ -505,8 +518,10 @@ def run_scan(args):
         return
     if not args.tmdb_api_key:
         note("no TMDB API key -- movie titles come from filenames.")
+    if args.only:
+        note(f"only scanning {', '.join(args.only)}.")
     # Checked first, so a bad --sub-lang fails before the slow part.
-    subtitles = None if args.no_subs else subtitle_setup(args)
+    subtitles = None if args.no_subs or args.only else subtitle_setup(args)
     root = Path(args.root)
     cache = {}
     counts = scan_to_queue(
@@ -1263,6 +1278,7 @@ def add_scan_args(subparsers):
         "--no-tvmaze", action="store_true",
         help="Don't look episodes up on TVmaze.",
     )
+    add_only_arg(scan_p, ALL_FIELDS, "subtitle downloading")
     add_subtitle_args(scan_p)
 
 

@@ -35,6 +35,37 @@ def add_dry_run_arg(subparser):
     )
 
 
+def parse_only(text, choices):
+    """"title, genre" -> ("title", "genre"), each one of `choices`."""
+    fields = []
+    for part in text.split(","):
+        field = part.strip().lower()
+        if not field:
+            continue
+        if field not in choices:
+            raise argparse.ArgumentTypeError(
+                f"unknown field {field!r} (choose from "
+                f"{', '.join(choices)})"
+            )
+        if field not in fields:
+            fields.append(field)
+    if not fields:
+        raise argparse.ArgumentTypeError("no fields given")
+    return tuple(fields)
+
+
+def add_only_arg(subparser, choices, skipped):
+    """`--only "title, genre"`: scan just these queue fields.
+    `skipped` names the downloads --only also turns off."""
+    subparser.add_argument(
+        "--only", metavar="FIELDS",
+        type=lambda text: parse_only(text, choices),
+        help="Only look for changes to these comma-separated fields "
+             f"({', '.join(choices)}); the queue holds just them, and "
+             f"{skipped} is skipped.",
+    )
+
+
 def add_check_parser(subparsers):
     check_p = subparsers.add_parser(
         "check", help="Sanity-check a queued changes file.",

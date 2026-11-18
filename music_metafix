@@ -50,8 +50,8 @@ from mutagen.id3 import TALB, TCON, TIT2, TPE1, TRCK
 from common import check as chk
 from common.cli import (
     DEFAULT_TMP_DIR, SCANNED_ROOT_HELP, add_check_parser, add_convert_parser,
-    add_dir_arg, add_dry_run_arg, add_queue_arg, add_root_arg, build_parser,
-    run_step,
+    add_dir_arg, add_dry_run_arg, add_only_arg, add_queue_arg, add_root_arg,
+    build_parser, run_step,
 )
 from common.ffmpeg import (
     replace_with, require_ffmpeg, run_ffmpeg, temp_output_path,
@@ -63,7 +63,8 @@ from common.files import (
 from common.http import cached
 from common.queue import (
     apply_queue, build_queue_fields, load_queue, print_scan_summary,
-    render_yaml_scalar, scan_to_queue, verify_queue_root,
+    render_yaml_scalar, restrict_updates, scan_fields, scan_to_queue,
+    verify_queue_root,
 )
 from common.steps import convert_extensions, process_each
 from common.text import (
@@ -75,6 +76,8 @@ from common.ui import (
 )
 
 QUEUE_FIELDS = ("album", "artist", "genre", "title", "tracknumber")
+# Queue fields scan takes from folder names alone, without MusicBrainz.
+FOLDER_FIELDS = {"album"}
 AUDIO_EXTENSIONS = {
     ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".wma", ".wav",
 }
@@ -709,8 +712,17 @@ def compute_scan_change(root, path, args, cache):
         filename_track += track_offset
     filename_title = strip_filename_track_prefix(path.stem).strip()
 
+    keys = scan_fields(QUEUE_FIELDS, args)
+    file = str(path.relative_to(root))
     updates = {}
     queue_folder_album(updates, current, album_name)
+    if set(keys) <= FOLDER_FIELDS:
+        # Nothing to look up on MusicBrainz.
+        updates = restrict_updates(updates, keys)
+        fields, previous = build_queue_fields(
+            current, updates, keys, coerce_queue_field,
+        )
+        return file, fields, previous, bool(updates)
     track_map = album_tracks(
         artist_name, album_name, args, cache, track_count,
     ) or {}
@@ -725,12 +737,13 @@ def compute_scan_change(root, path, args, cache):
     if pos is not None:
         queue_genre(updates, current, track_map[pos].get("genre"))
     queue_filename_track(updates, current, filename_track)
+    updates = restrict_updates(updates, keys)
     # Unmatched files are always queued, so check flags their nulls.
     changed = bool(updates) or pos is None
     fields, previous = build_queue_fields(
-        current, updates, QUEUE_FIELDS, coerce_queue_field,
+        current, updates, keys, coerce_queue_field,
     )
-    return str(path.relative_to(root)), fields, previous, changed
+    return file, fields, previous, changed
 
 
 def run_scan(args):
@@ -739,6 +752,8 @@ def run_scan(args):
     if not configure_musicbrainz(args.musicbrainz_contact):
         missing_package("musicbrainzngs", "musicbrainzngs",
                         "text-search recognition disabled.")
+    if args.only:
+        note(f"only scanning {', '.join(args.only)}.")
     root = Path(args.root)
     cache = {}
     counts = scan_to_queue(
@@ -746,7 +761,7 @@ def run_scan(args):
         lambda path: compute_scan_change(root, path, args, cache),
         "Music", album_group_key,
     )
-    if not args.no_art:
+    if not (args.no_art or args.only):
         queue_album_art(root, args.art_dir, args.art_fn,
                         args.musicbrainz_contact)
     print_scan_summary(counts, args)
@@ -1213,6 +1228,7 @@ def add_scan_args(subparsers):
     add_root_arg(scan_p, ROOT_HELP)
     add_queue_arg(scan_p, "Where to write queued changes")
     add_album_art_args(scan_p)
+    add_only_arg(scan_p, QUEUE_FIELDS, "album art")
     scan_p.add_argument(
         "--musicbrainz-contact",
         default=os.environ.get("MMF_MUSICBRAINZ_CONTACT"),
